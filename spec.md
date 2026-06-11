@@ -9,6 +9,8 @@ Alpine APK repositories.
 be implemented inside the Go binary and must not depend on third-party command
 line tools such as `apt`, `apk`, `gpg`, `gpgv`, `curl`, `wget`, `rsync`,
 `tar`, `sha256sum`, or similar helpers.
+Third-party Go packages may be used as implementation dependencies, but the
+final `mirrorsync` executable must be statically linked.
 
 The mirrored repository must remain compatible with the original upstream
 trust model. Clients change only repository URLs and continue to use the
@@ -30,6 +32,8 @@ signatures and never rewrites or re-signs repository metadata.
 - Support HTTP and HTTPS proxies for outbound source requests.
 - Reuse outbound HTTP connections when the remote endpoint permits it.
 - Prefer HTTP/2 over HTTP/1.1 when the remote endpoint supports it.
+- Support built-in periodic sync execution without relying on external
+  schedulers.
 
 ## Non-Goals
 
@@ -52,6 +56,7 @@ mirrorsync plan   -config config.yaml
 mirrorsync sync   -config config.yaml
 mirrorsync verify -config config.yaml
 mirrorsync prune  -config config.yaml
+mirrorsync run    -config config.yaml
 ```
 
 Commands:
@@ -64,10 +69,15 @@ Commands:
   package checksums without publishing changes.
 - `prune` removes files that are not referenced by current metadata after
   confirming they are outside the active metadata set.
+- `run` starts a long-running built-in scheduler that repeatedly performs
+  complete mirror sync cycles according to `sync.schedule`.
 
-All commands require `-config`. Invalid configuration, failed signature
-verification, checksum mismatch, unavailable required files, or publish errors
-must return a non-zero exit status.
+All commands require `-config`. For one-shot commands, invalid configuration,
+failed signature verification, checksum mismatch, unavailable required files,
+or publish errors must return a non-zero exit status. For `run`, invalid
+startup configuration and fatal scheduler errors must return a non-zero exit
+status; individual sync cycle failures are reported and do not stop the
+scheduler.
 
 ## Configuration
 
@@ -83,15 +93,20 @@ storage:
 
 sync:
   concurrency: 16
-  retries: 3
   prune: true
-  max_connections_per_source: 4
-  proxy:
-    url: https://proxy.example.com:8443
-  rate_limit:
-    requests_per_second: 50
-    requests_per_second_per_host: 10
-    burst: 20
+  schedule:
+    cron: "0 3 * * *"
+    timezone: Asia/Tehran
+    run_on_start: true
+  download:
+    retries: 3
+    max_connections_per_source: 4
+    proxy:
+      url: https://proxy.example.com:8443
+    rate_limit:
+      requests_per_second: 50
+      requests_per_second_per_host: 10
+      burst: 20
 
 apt:
   repositories:
@@ -176,38 +191,109 @@ apk:
   `mirror_sources` to provide an explicit fallback position in the source
   order.
 - Source-level rate limits override repository-level limits.
-- Repository-level rate limits override global limits.
+- Repository-level rate limits override global download limits from
+  `sync.download.rate_limit`.
 - Missing optional rate-limit fields inherit from the next broader scope.
-- `sync.max_connections_per_source`, when set, is the default maximum number
-  of established outbound connections used for each configured source.
+- `sync.concurrency`, when set, must be a positive integer and bounds total
+  concurrent sync work across all configured repositories in each sync cycle,
+  including cycles started by `sync` and `run`.
+- `sync.schedule` configures built-in periodic execution for the `run`
+  command.
+- `run` requires `sync.schedule` to specify exactly one schedule trigger:
+  `interval` or `cron`.
+- `sync.schedule.interval`, when set, must be a positive duration string with
+  an explicit unit, such as `15m`, `1h`, or `24h`.
+- `sync.schedule.cron`, when set, starts sync cycles at times matched by a
+  crontab-style expression.
+- `sync.schedule.cron` must use quoted five-field crontab syntax:
+  `minute hour day-of-month month day-of-week`, such as `"0 3 * * *"`.
+- `sync.schedule.cron` must support `*`, comma-separated values, ranges, and
+  step values such as `*/15`, `1,15`, and `1-5`.
+- In `sync.schedule.cron`, day-of-week values `0` and `7` both mean Sunday.
+- When both day-of-month and day-of-week are restricted, a time matches when
+  either field matches, following traditional crontab behavior.
+- `sync.schedule.cron` does not include a command field and must not be
+  executed by the system crontab.
+- `sync.schedule.timezone` is required when `sync.schedule.cron` is set and
+  must be an IANA timezone name, such as `UTC`, `Asia/Tehran`, or
+  `Europe/Berlin`.
+- `sync.schedule.run_on_start`, when unset, defaults to `true`.
+- The `sync` command runs exactly one sync cycle and does not repeat when
+  `sync.schedule` is configured.
+- `sync.download` configures outbound source downloads for one-shot and
+  scheduled sync cycles.
+- `sync.download.retries`, when set, must be a non-negative integer.
+- `sync.download.max_connections_per_source`, when set, is the default maximum
+  number of established outbound connections used for each configured source.
 - Source-level `max_connections`, when set on `primary_source` or a
-  `mirror_sources` entry, overrides `sync.max_connections_per_source` for that
-  source.
+  `mirror_sources` entry, overrides
+  `sync.download.max_connections_per_source` for that source.
 - Connection limit values must be positive integers.
-- A proxy may be configured globally with `sync.proxy`, per source with
-  `primary_source.proxy` or `mirror_sources[].proxy`, or globally from the
-  `MIRRORSYNC_PROXY` environment variable.
+- A proxy may be configured globally with `sync.download.proxy`, per source
+  with `primary_source.proxy` or `mirror_sources[].proxy`, or globally from
+  the `MIRRORSYNC_PROXY` environment variable.
 - Proxy `url` values and `MIRRORSYNC_PROXY`, when set, must use the `http` or
   `https` scheme.
 - A proxy object must specify exactly one of `url` or `mode: direct`.
 - `mode: direct` disables proxy use for that scope.
-- Source-level proxy configuration takes precedence over `sync.proxy`.
-- `sync.proxy` takes precedence over `MIRRORSYNC_PROXY`.
+- Source-level proxy configuration takes precedence over `sync.download.proxy`.
+- `sync.download.proxy` takes precedence over `MIRRORSYNC_PROXY`.
 - An empty `MIRRORSYNC_PROXY` value is treated as unset.
-- Sources with no source-level proxy inherit `sync.proxy` when it is set.
-- Sources with no source-level proxy and no `sync.proxy` inherit
+- Sources with no source-level proxy inherit `sync.download.proxy` when it is
+  set.
+- Sources with no source-level proxy and no `sync.download.proxy` inherit
   `MIRRORSYNC_PROXY` when it is set.
-- Sources with no source-level proxy, no `sync.proxy`, and no
+- Sources with no source-level proxy, no `sync.download.proxy`, and no
   `MIRRORSYNC_PROXY` use direct connections.
+
+## Periodic Sync Semantics
+
+`mirrorsync run` provides built-in periodic synchronization. It must not rely
+on external shell loops, cron jobs, systemd timers, or other third-party
+schedulers to repeat sync cycles.
+
+Requirements:
+
+- `run` validates configuration at startup before network access or filesystem
+  mutation.
+- `run` uses the configured `sync.schedule` trigger to determine when to start
+  sync cycles.
+- When `sync.schedule.run_on_start` is `true`, `run` starts the first sync
+  cycle immediately after successful startup validation, then uses the
+  configured schedule for later cycles.
+- When `sync.schedule.run_on_start` is `false`, `run` waits one full interval
+  before starting the first interval-based sync cycle, or waits until the next
+  time matching the cron expression before starting the first cron-based sync
+  cycle.
+- For cron schedules, `mirrorsync` evaluates the configured expression in
+  `sync.schedule.timezone`.
+- For cron schedules, daylight-saving transitions must not create duplicate
+  sync cycles for the same matched local time.
+- If a cron-matched wall-clock time does not exist on a calendar date because
+  of a daylight-saving transition, `mirrorsync` starts that sync cycle at the
+  next valid local time after the matched time.
+- Each scheduled cycle uses the same download, verification, publishing,
+  pruning, proxy, rate-limit, and connection-reuse semantics as `sync`.
+- Scheduled sync cycles must not overlap.
+- If a scheduled start time occurs while a sync cycle is still running,
+  `mirrorsync` starts the next cycle only after the current cycle completes.
+- A failed scheduled cycle leaves the last successfully published mirror active
+  whenever the underlying filesystem permits it.
+- A failed scheduled cycle is reported with the same repository, file, source,
+  and verification context required for `sync` failures.
+- A failed scheduled cycle does not stop `run`; the next cycle is still
+  attempted at the next scheduled time.
+- On graceful shutdown, `run` stops starting new cycles and preserves the same
+  publish-safety guarantees as an interrupted one-shot `sync`.
 
 ## Proxy Semantics
 
 For each source request, `mirrorsync` resolves an effective proxy from the
-source configuration, global configuration, and environment. When the effective
-proxy is a URL, `mirrorsync` must send the request through that proxy. When the
-effective proxy is direct, `mirrorsync` must connect directly to the source.
-The proxy URL scheme controls whether traffic between `mirrorsync` and the
-proxy is encrypted.
+source configuration, `sync.download.proxy`, and environment. When the
+effective proxy is a URL, `mirrorsync` must send the request through that
+proxy. When the effective proxy is direct, `mirrorsync` must connect directly
+to the source. The proxy URL scheme controls whether traffic between
+`mirrorsync` and the proxy is encrypted.
 
 Requirements:
 
@@ -261,8 +347,8 @@ Requirements:
 - Plain HTTP connections use HTTP/1.1 unless a peer-supported HTTP/2 cleartext
   mode is explicitly implemented.
 - Each configured source has an effective connection limit from source-level
-  `max_connections`, `sync.max_connections_per_source`, or the implementation
-  default when neither is set.
+  `max_connections`, `sync.download.max_connections_per_source`, or the
+  implementation default when neither is set.
 - Direct source requests must not exceed the source's effective connection
   limit for established connections to the source scheme, host, and port.
 - HTTPS source requests through a proxy must not exceed the source's effective
@@ -314,8 +400,8 @@ Supported fields:
   host in the scope.
 - `burst`: maximum burst size for the scope.
 
-If no rate limit is configured, `mirrorsync` may issue requests up to the global
-sync concurrency limit.
+If no rate limit is configured, `mirrorsync` may issue requests up to the
+effective repository concurrency limit and applicable source connection limits.
 
 ## APT Keyring Semantics
 
@@ -405,6 +491,31 @@ If a mirror source returns a missing, incomplete, or checksum-invalid payload,
 `mirrorsync` must reject that payload and try the next source. The sync fails
 only after all configured sources fail to provide a valid payload.
 
+## Repository Execution Semantics
+
+A sync cycle may process multiple configured repositories concurrently.
+Repository execution is not required to be serial unless constrained by
+the effective repository concurrency limit, source connection limits, rate
+limits, or per-repository locks.
+
+Requirements:
+
+- The effective repository concurrency limit bounds total concurrent sync work
+  across APT and APK repositories within a sync cycle.
+- The effective repository concurrency limit is `sync.concurrency` when
+  configured, otherwise the implementation default.
+- Different configured repositories may download, verify, stage, and publish
+  concurrently when concurrency limits permit it.
+- A repository sync must hold that repository's per-repository lock before
+  mutating its staging or published paths.
+- Two sync operations for the same repository must not overlap.
+- Publishing atomicity is scoped per repository; one repository may publish
+  successfully while another repository in the same sync cycle fails.
+- For the `sync` command, the command exits non-zero if any configured
+  repository fails during the cycle.
+- For the `run` command, scheduled cycles do not overlap with each other, but
+  repositories inside a single scheduled cycle may run concurrently.
+
 ## Publishing Semantics
 
 Publishing must be atomic from a client consistency perspective.
@@ -457,6 +568,18 @@ For APK repositories, verification must confirm:
 - The built `mirrorsync` executable performs mirroring, hashing, archive
   parsing, and signature verification without invoking third-party command-line
   tools.
+- The final `mirrorsync` executable is statically linked, including when the
+  implementation uses third-party Go packages.
+- `mirrorsync run` performs periodic sync cycles using its built-in scheduler
+  and does not require cron, systemd timers, shell loops, or other external
+  schedulers.
+- `mirrorsync run` can start sync cycles from a configured crontab-style
+  expression, such as `"0 3 * * *"` in a configured timezone.
+- Scheduled sync cycles do not overlap, and a failed scheduled cycle does not
+  stop later scheduled cycles.
+- Multiple configured repositories may sync in parallel within one sync cycle,
+  bounded by the effective repository concurrency limit and source limits.
+- Sync operations for the same configured repository do not overlap.
 - APT clients can run `apt update` against the mirror using the original
   `signed-by` keyring.
 - Alpine clients can run `apk update` against the mirror using the original
@@ -473,13 +596,13 @@ For APK repositories, verification must confirm:
   proxy is encrypted for both HTTP and HTTPS source URLs.
 - When an HTTP proxy URL is configured, traffic between `mirrorsync` and the
   proxy is not encrypted by the proxy connection.
-- A source-level proxy URL overrides `sync.proxy` and `MIRRORSYNC_PROXY` for
-  that source.
-- A source-level `mode: direct` bypasses inherited `sync.proxy` and
+- A source-level proxy URL overrides `sync.download.proxy` and
   `MIRRORSYNC_PROXY` settings for that source.
-- When source-level proxy configuration and `sync.proxy` are unset and
-  `MIRRORSYNC_PROXY` is set, `mirrorsync` uses the proxy from the environment
-  variable.
+- A source-level `mode: direct` bypasses inherited `sync.download.proxy` and
+  `MIRRORSYNC_PROXY` settings for that source.
+- When source-level proxy configuration and `sync.download.proxy` are unset
+  and `MIRRORSYNC_PROXY` is set, `mirrorsync` uses the proxy from the
+  environment variable.
 - HTTPS source URLs work through the configured proxy by using `CONNECT`.
 - Repeated requests to the same source or proxy reuse existing connections when
   the peer permits keep-alive.

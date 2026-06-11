@@ -1,0 +1,13 @@
+# Local build artifacts
+/mirrorsync
+/bin/
+/dist/
+
+# Local runtime output
+/.staging/
+/mirrors/
+
+# Test and coverage output
+/coverage.out
+/testdata/
+*.test

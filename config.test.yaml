@@ -1,0 +1,59 @@
+version: 1
+
+storage:
+  root: /tmp/mirrorsync-test/mirrors
+  staging: /tmp/mirrorsync-test/staging
+
+sync:
+  concurrency: 4
+  retries: 2
+  prune: true
+  max_connections_per_source: 2
+  rate_limit:
+    requests_per_second: 5
+    requests_per_second_per_host: 5
+    burst: 5
+
+apt:
+  repositories:
+    - name: docker-ubuntu
+      publish_path: docker-ubuntu
+      keyring: /etc/apt/keyrings/docker.asc
+      primary_source:
+        url: https://download.docker.com/linux/ubuntu
+      architectures:
+        - amd64
+      suites:
+        - name: noble
+          components:
+            - stable
+    - name: ubuntu
+      publish_path: ubuntu
+      keyring: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+      primary_source:
+        url: https://archive.ubuntu.com/ubuntu
+      mirror_sources:
+        - url: https://mirror.hetzner.com/ubuntu/packages
+        - url: https://archive.ubuntu.com/ubuntu
+      architectures:
+        - amd64
+      suites:
+        - name: noble
+          components:
+            - main
+
+apk:
+  repositories:
+    - name: alpine
+      publish_path: alpine
+      keys_dir: /home/torob/source-codes/torob/mirror-sync/testdata/alpine-keys
+      primary_source:
+        url: https://dl-cdn.alpinelinux.org/alpine
+      mirror_sources:
+        - url: https://dl-cdn.alpinelinux.org/alpine
+      architectures:
+        - x86_64
+      versions:
+        - name: v3.22
+          repositories:
+            - main

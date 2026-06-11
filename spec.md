@@ -47,6 +47,25 @@ signatures and never rewrites or re-signs repository metadata.
 - `mirrorsync` does not throttle bandwidth; rate limits apply only to request
   starts.
 
+## Implementation Organization
+
+The Go implementation must be organized into small packages and files by
+responsibility. The implementation must not place all runtime code in one large
+source file.
+
+Recommended package boundaries include:
+
+- Command-line entrypoint and command dispatch.
+- Configuration loading, normalization, and validation.
+- Outbound HTTP source clients, proxy resolution, rate limiting, retries, and
+  connection limit handling.
+- APT metadata fetching, OpenPGP verification, index parsing, and package
+  verification.
+- APK index signature verification, APK metadata parsing, and package
+  verification.
+- Repository planning, sync execution, publishing, pruning, and verification.
+- Built-in scheduling and graceful shutdown.
+
 ## Command Line Interface
 
 The executable name is `mirrorsync`.
@@ -570,6 +589,8 @@ For APK repositories, verification must confirm:
   tools.
 - The final `mirrorsync` executable is statically linked, including when the
   implementation uses third-party Go packages.
+- The Go implementation is split into focused files or packages by
+  responsibility and does not put all runtime code in one source file.
 - `mirrorsync run` performs periodic sync cycles using its built-in scheduler
   and does not require cron, systemd timers, shell loops, or other external
   schedulers.

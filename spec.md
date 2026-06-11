@@ -47,6 +47,19 @@ signatures and never rewrites or re-signs repository metadata.
 - `mirrorsync` does not throttle bandwidth; rate limits apply only to request
   starts.
 
+## Limitations
+
+- `mirrorsync` does not provide whole-repository multi-file atomic snapshots in
+  version 1. Publishing safety relies on package payloads being present before
+  metadata, metadata files being replaced with atomic same-filesystem renames,
+  and authoritative signed metadata being published last.
+- A crash or power loss while publishing metadata may leave a temporary mix of
+  old and new metadata files. Clients must continue to rely on upstream
+  signature and checksum verification; a mixed metadata set may cause client
+  update failures, but must not be accepted as trusted inconsistent metadata.
+  A later startup sync repairs the repository by fetching and publishing fresh
+  authoritative metadata.
+
 ## Implementation Organization
 
 The Go implementation must be organized into small packages and files by
@@ -133,7 +146,6 @@ sync:
   schedule:
     cron: "0 3 * * *"
     timezone: Asia/Tehran
-    run_on_start: true
   download:
     retries: 3
     max_connections_per_source: 4
@@ -258,7 +270,6 @@ apk:
 - `sync.schedule.timezone` is required when `sync.schedule.cron` is set and
   must be an IANA timezone name, such as `UTC`, `Asia/Tehran`, or
   `Europe/Berlin`.
-- `sync.schedule.run_on_start`, when unset, defaults to `true`.
 - The `sync` command runs exactly one sync cycle and does not repeat when
   `sync.schedule` is configured.
 - `sync.download` configures outbound source downloads for one-shot and
@@ -299,13 +310,12 @@ Requirements:
   mutation.
 - `run` uses the configured `sync.schedule` trigger to determine when to start
   sync cycles.
-- When `sync.schedule.run_on_start` is `true`, `run` starts the first sync
-  cycle immediately after successful startup validation, then uses the
-  configured schedule for later cycles.
-- When `sync.schedule.run_on_start` is `false`, `run` waits one full interval
-  before starting the first interval-based sync cycle, or waits until the next
-  time matching the cron expression before starting the first cron-based sync
-  cycle.
+- `run` starts a sync cycle immediately after successful startup validation,
+  before waiting for the configured schedule. This startup sync is required to
+  verify and reconcile repository state after crashes, interrupted syncs,
+  stale staging files, or manual filesystem changes.
+- After the startup sync cycle finishes, `run` uses the configured schedule for
+  later cycles.
 - For cron schedules, `mirrorsync` evaluates the configured expression in
   `sync.schedule.timezone`.
 - For cron schedules, daylight-saving transitions must not create duplicate
@@ -630,6 +640,10 @@ Requirements:
 - Metadata is staged separately and must not be published until every package
   payload referenced by that metadata is present and verified in the published
   tree.
+- After acquiring the repository lock, staged metadata left by previous
+  interrupted sync attempts must be deleted or ignored. Each sync must fetch
+  and verify authoritative metadata from `primary_source` before deciding which
+  staged package payloads may be reused.
 - Package payloads are published before metadata that references them.
 - Signed metadata is published last.
 - Metadata from failed sync attempts is not published.
@@ -664,6 +678,9 @@ For APK repositories, verification must confirm:
 - Checksum mismatch rejects the downloaded file.
 - Stale lock files left by crashed or killed processes do not block future
   syncs when no OS advisory lock is held.
+- Staged metadata left by interrupted sync attempts is not trusted on later
+  runs and is deleted or ignored before new authoritative metadata is fetched
+  and verified.
 - A failed package download does not publish new metadata.
 - A failed publish leaves the last successfully published repository usable
   whenever the underlying filesystem permits it.
@@ -688,6 +705,9 @@ For APK repositories, verification must confirm:
 - `mirrorsync run` performs periodic sync cycles using its built-in scheduler
   and does not require cron, systemd timers, shell loops, or other external
   schedulers.
+- `mirrorsync run` always performs an immediate startup sync after successful
+  validation to verify and reconcile repository integrity before waiting for
+  scheduled cycles.
 - `mirrorsync run` can start sync cycles from a configured crontab-style
   expression, such as `"0 3 * * *"` in a configured timezone.
 - Scheduled sync cycles do not overlap, and a failed scheduled cycle does not

@@ -14,10 +14,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ulikunitz/xz"
-	"golang.org/x/crypto/openpgp"
-	"golang.org/x/crypto/openpgp/armor"
-	"golang.org/x/crypto/openpgp/clearsign"
 
 	"mirrorsync/internal/config"
 	"mirrorsync/internal/download"
@@ -190,7 +190,7 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 	if err != nil {
 		return "", nil, nil, err
 	}
-	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig)); err != nil {
+	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
 		return "", nil, nil, fmt.Errorf("apt %s verify %s: %w", r.Repo.Name, sigRel, err)
 	}
 	hashes, err := parseReleaseHashes(string(releaseData))
@@ -259,7 +259,7 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 			if err != nil {
 				return out, err
 			}
-			if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig)); err != nil {
+			if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
 				return out, err
 			}
 			releaseText = string(releaseData)
@@ -325,7 +325,7 @@ func verifyInRelease(data []byte, keyring openpgp.EntityList) ([]byte, error) {
 	if block == nil {
 		return nil, fmt.Errorf("not a clearsigned document")
 	}
-	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body); err != nil {
+	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
 		return nil, err
 	}
 	return block.Bytes, nil

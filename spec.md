@@ -66,6 +66,23 @@ Recommended package boundaries include:
 - Repository planning, sync execution, publishing, pruning, and verification.
 - Built-in scheduling and graceful shutdown.
 
+## Build and Test Workflow
+
+The repository must provide a `Makefile` for common development and validation
+tasks. Developers and CI should not need to remember long `go` command lines
+for normal workflows.
+
+Required targets:
+
+- `make build` builds the `mirrorsync` executable.
+- `make test` runs the normal automated test suite.
+- `make e2e` runs the real end-to-end test workflow using `config.test.yaml`.
+
+The built release binary should be minimized in size while preserving required
+runtime behavior. At minimum, release builds should strip unnecessary symbol
+and debug information and avoid embedding avoidable local path or build
+metadata.
+
 ## Command Line Interface
 
 The executable name is `mirrorsync`.
@@ -612,6 +629,10 @@ For APK repositories, verification must confirm:
   implementation uses third-party Go packages.
 - The Go implementation is split into focused files or packages by
   responsibility and does not put all runtime code in one source file.
+- The repository provides `make build`, `make test`, and `make e2e` targets
+  for common build, test, and real end-to-end validation workflows.
+- The built release executable is minimized in size, including stripped
+  unnecessary symbol and debug information.
 - Package payload downloads are streamed with bounded memory usage and are not
   stored entirely in memory before being staged or verified.
 - `mirrorsync run` performs periodic sync cycles using its built-in scheduler

@@ -439,6 +439,19 @@ verification.
 
 Requirements:
 
+- Before downloading a package payload, `mirrorsync` must first check whether
+  the package already exists at its final published path and matches the
+  expected size and checksum from current verified metadata. A matching
+  published payload is reused and must not be downloaded again.
+- If the package is missing from the published path, `mirrorsync` may check for
+  a previously staged payload for the same repository and relative package
+  path. A staged payload may be reused only after it is verified against the
+  current metadata.
+- A verified staged payload is moved into the final published path with the
+  same atomic rename semantics as a newly downloaded payload.
+- A staged payload that is partial, checksum-invalid, size-invalid, or not
+  referenced by the current metadata must be deleted or ignored and must not be
+  published.
 - `.deb` and `.apk` payload downloads are copied from the response body to a
   temporary staging file using bounded-size buffers.
 - Size and checksum verification for package payloads is performed while
@@ -713,6 +726,8 @@ For APK repositories, verification must confirm:
 - Corrupt partial downloads are never accepted.
 - Verified package payloads are moved from staging to the published tree with
   atomic same-filesystem renames, not cross-filesystem copy-and-delete moves.
+- Already published package payloads and valid staged payloads are reused after
+  checksum and size verification instead of being downloaded again.
 - Metadata is not published before every referenced package file is present.
 - Prune keeps all files referenced by current metadata.
 - `plan` reports intended actions without changing the publish tree.

@@ -41,7 +41,7 @@ apt:
       suites:
         - name: noble
           components:
-            - main
+            - restricted
 
 apk:
   repositories:

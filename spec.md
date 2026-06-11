@@ -5,6 +5,11 @@
 `mirrorsync` is a Go command-line tool for transparent mirroring of APT and
 Alpine APK repositories.
 
+`mirrorsync` is distributed as a standalone executable. Runtime behavior must
+be implemented inside the Go binary and must not depend on third-party command
+line tools such as `apt`, `apk`, `gpg`, `gpgv`, `curl`, `wget`, `rsync`,
+`tar`, `sha256sum`, or similar helpers.
+
 The mirrored repository must remain compatible with the original upstream
 trust model. Clients change only repository URLs and continue to use the
 original vendor keyrings. `mirrorsync` therefore preserves upstream metadata and
@@ -313,12 +318,16 @@ APT repository signature verification uses the configured `keyring`.
 Requirements:
 
 - A local keyring path, whether configured as absolute or relative, is resolved
-  to an absolute path and passed to `gpgv` as trusted key material for that APT
-  repository.
+  to an absolute path and loaded by `mirrorsync` as trusted OpenPGP key
+  material for that APT repository.
 - Keyring paths must point to files that exist on the local filesystem.
 - Keyring paths must not use URL schemes such as `https://` or `file://`.
-- If the keyring cannot be resolved, read, or passed to `gpgv`, the affected
-  APT repository sync fails before metadata verification.
+- Keyring parsing and OpenPGP signature verification must happen in-process.
+  `mirrorsync` must not shell out to `gpg`, `gpgv`, or other signature
+  verification tools.
+- If the keyring cannot be resolved, read, parsed, or used for signature
+  verification, the affected APT repository sync fails before metadata
+  verification.
 
 ### APT Keyring Examples
 
@@ -358,7 +367,7 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 
 - Fetch `InRelease` from `primary_source` when available.
 - Fall back to `Release` plus `Release.gpg` when `InRelease` is unavailable.
-- Verify upstream signatures with `gpgv` and the configured `keyring`.
+- Verify upstream OpenPGP signatures in-process with the configured `keyring`.
 - Parse the verified `Release` metadata.
 - Download referenced `Packages.*` indexes from `primary_source`.
 - Verify each package index against hashes from the verified `Release` file.
@@ -378,7 +387,7 @@ For each configured Alpine version, repository, and architecture, `mirrorsync`
 must:
 
 - Fetch official `APKINDEX.tar.gz` from `primary_source`.
-- Verify the embedded APK index signature with keys from `keys_dir`.
+- Verify the embedded APK index signature in-process with keys from `keys_dir`.
 - Parse package names, versions, sizes, and checksums from the verified index.
 - Download `.apk` payloads from `mirror_sources` in order.
 - Accept an `.apk` only when it matches the verified APK index metadata.
@@ -437,6 +446,9 @@ For APK repositories, verification must confirm:
 
 ## Acceptance Criteria
 
+- The built `mirrorsync` executable performs mirroring, hashing, archive
+  parsing, and signature verification without invoking third-party command-line
+  tools.
 - APT clients can run `apt update` against the mirror using the original
   `signed-by` keyring.
 - Alpine clients can run `apk update` against the mirror using the original

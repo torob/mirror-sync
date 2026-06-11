@@ -6,6 +6,7 @@
 # Local runtime output
 /.staging/
 /mirrors/
+/.e2e/
 
 # Test and coverage output
 /coverage.out

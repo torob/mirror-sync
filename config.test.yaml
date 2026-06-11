@@ -1,8 +1,8 @@
 version: 1
 
 storage:
-  root: /tmp/mirrorsync-test/mirrors
-  staging: /tmp/mirrorsync-test/staging
+  root: .e2e/repos
+  staging: .e2e/staged
 
 sync:
   concurrency: 4
@@ -47,7 +47,7 @@ apk:
   repositories:
     - name: alpine
       publish_path: alpine
-      keys_dir: /home/torob/source-codes/torob/mirror-sync/testdata/alpine-keys
+      keys_dir: .e2e/alpine-keys
       primary_source:
         url: https://dl-cdn.alpinelinux.org/alpine
       mirror_sources:

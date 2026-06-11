@@ -1,0 +1,477 @@
+# Transparent APT/APK Mirror Sync Tool Specification
+
+## Overview
+
+`mirrorsync` is a Go command-line tool for transparent mirroring of APT and
+Alpine APK repositories.
+
+The mirrored repository must remain compatible with the original upstream
+trust model. Clients change only repository URLs and continue to use the
+original vendor keyrings. `mirrorsync` therefore preserves upstream metadata and
+signatures and never rewrites or re-signs repository metadata.
+
+## Goals
+
+- Mirror APT and Alpine APK repositories into a local served directory.
+- Treat `primary_source` as authoritative for signed metadata.
+- Download package payloads from ordered `mirror_sources`.
+- Verify every package payload against checksums and sizes from upstream
+  metadata before publishing it.
+- Fall back to `primary_source` when mirrors are missing packages, return
+  errors, or provide invalid payloads.
+- Publish package files before signed metadata so clients never observe
+  metadata that references unavailable package files.
+- Support pruning files that are not referenced by current published metadata.
+- Support HTTP and HTTPS proxies for outbound source requests.
+- Reuse outbound HTTP connections when the remote endpoint permits it.
+- Prefer HTTP/2 over HTTP/1.1 when the remote endpoint supports it.
+
+## Non-Goals
+
+- `mirrorsync` does not create custom repositories.
+- `mirrorsync` does not filter packages, components, architectures, or APK
+  repositories beyond the configured upstream metadata selection.
+- `mirrorsync` does not generate, edit, or re-sign APT `Release` metadata.
+- `mirrorsync` does not generate, edit, or re-sign APK `APKINDEX.tar.gz`
+  metadata.
+- `mirrorsync` does not provide snapshot retention in version 1.
+- `mirrorsync` does not throttle bandwidth; rate limits apply only to request
+  starts.
+
+## Command Line Interface
+
+The executable name is `mirrorsync`.
+
+```text
+mirrorsync plan   -config config.yaml
+mirrorsync sync   -config config.yaml
+mirrorsync verify -config config.yaml
+mirrorsync prune  -config config.yaml
+```
+
+Commands:
+
+- `plan` reports the repositories, metadata, packages, source order, expected
+  downloads, and prune candidates without modifying the publish tree.
+- `sync` downloads and verifies metadata and package payloads, then publishes a
+  complete mirror update.
+- `verify` validates the current published mirror against upstream metadata and
+  package checksums without publishing changes.
+- `prune` removes files that are not referenced by current metadata after
+  confirming they are outside the active metadata set.
+
+All commands require `-config`. Invalid configuration, failed signature
+verification, checksum mismatch, unavailable required files, or publish errors
+must return a non-zero exit status.
+
+## Configuration
+
+Configuration is YAML with a required `version` field and optional top-level
+`apt` and `apk` sections.
+
+```yaml
+version: 1
+
+storage:
+  root: /srv/mirrors
+  staging: /srv/mirrors/.staging
+
+sync:
+  concurrency: 16
+  retries: 3
+  prune: true
+  max_connections_per_source: 4
+  proxy:
+    url: https://proxy.example.com:8443
+  rate_limit:
+    requests_per_second: 50
+    requests_per_second_per_host: 10
+    burst: 20
+
+apt:
+  repositories:
+    - name: ubuntu
+      publish_path: ubuntu
+      keyring: keyrings/ubuntu-archive-keyring.gpg
+      rate_limit:
+        requests_per_second: 30
+        burst: 50
+      primary_source:
+        url: https://archive.ubuntu.com/ubuntu
+        max_connections: 2
+        proxy:
+          url: https://metadata-proxy.example.com:8443
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+      mirror_sources:
+        - url: http://local-ubuntu-mirror.example.com/ubuntu
+          max_connections: 8
+          proxy:
+            mode: direct
+          rate_limit:
+            requests_per_second: 20
+            burst: 40
+        - url: https://archive.ubuntu.com/ubuntu
+          proxy:
+            url: http://fallback-proxy.example.com:8080
+          rate_limit:
+            requests_per_second: 5
+            burst: 10
+      architectures: [amd64]
+      suites:
+        - name: noble
+          components: [main, restricted, universe, multiverse]
+
+apk:
+  repositories:
+    - name: alpine
+      publish_path: alpine
+      keys_dir: /etc/apk/keys
+      primary_source:
+        url: https://dl-cdn.alpinelinux.org/alpine
+      mirror_sources:
+        - url: http://local-alpine.example.com/alpine
+          proxy:
+            mode: direct
+        - url: https://dl-cdn.alpinelinux.org/alpine
+      architectures: [x86_64]
+      versions:
+        - name: v3.24
+          repositories: [main, community]
+```
+
+### Configuration Rules
+
+- `version` must be `1`.
+- `storage.root` is the served mirror root.
+- `storage.staging` is used for temporary downloads and must not be inside a
+  client-visible repository path unless it is hidden from clients.
+- `publish_path` is relative to `storage.root`.
+- `publish_path` must not be absolute and must not escape `storage.root`.
+- Each configured `publish_path` is resolved against `storage.root`, cleaned,
+  and converted to an absolute path during configuration validation.
+- Resolved publish paths must be unique across all APT and APK repositories.
+  Configuration with duplicate resolved publish paths is invalid.
+- Repository `name` values must be unique within their package ecosystem.
+- `primary_source.url` is the authoritative metadata source.
+- APT `keyring` is required and must be a local filesystem path.
+- Relative local APT keyring paths are resolved relative to the directory that
+  contains the configuration file, then cleaned and converted to absolute
+  paths during configuration validation.
+- Local APT keyring paths must exist and be readable before APT metadata is
+  fetched.
+- `mirror_sources` are attempted in declaration order for package payloads.
+- `primary_source` may also appear in `mirror_sources` to provide an explicit
+  final fallback.
+- Source-level rate limits override repository-level limits.
+- Repository-level rate limits override global limits.
+- Missing optional rate-limit fields inherit from the next broader scope.
+- `sync.max_connections_per_source`, when set, is the default maximum number
+  of established outbound connections used for each configured source.
+- Source-level `max_connections`, when set on `primary_source` or a
+  `mirror_sources` entry, overrides `sync.max_connections_per_source` for that
+  source.
+- Connection limit values must be positive integers.
+- A proxy may be configured globally with `sync.proxy`, per source with
+  `primary_source.proxy` or `mirror_sources[].proxy`, or globally from the
+  `MIRRORSYNC_PROXY` environment variable.
+- Proxy `url` values and `MIRRORSYNC_PROXY`, when set, must use the `http` or
+  `https` scheme.
+- A proxy object must specify exactly one of `url` or `mode: direct`.
+- `mode: direct` disables proxy use for that scope.
+- Source-level proxy configuration takes precedence over `sync.proxy`.
+- `sync.proxy` takes precedence over `MIRRORSYNC_PROXY`.
+- An empty `MIRRORSYNC_PROXY` value is treated as unset.
+- Sources with no source-level proxy inherit `sync.proxy` when it is set.
+- Sources with no source-level proxy and no `sync.proxy` inherit
+  `MIRRORSYNC_PROXY` when it is set.
+- Sources with no source-level proxy, no `sync.proxy`, and no
+  `MIRRORSYNC_PROXY` use direct connections.
+
+## Proxy Semantics
+
+For each source request, `mirrorsync` resolves an effective proxy from the
+source configuration, global configuration, and environment. When the effective
+proxy is a URL, `mirrorsync` must send the request through that proxy. When the
+effective proxy is direct, `mirrorsync` must connect directly to the source.
+The proxy URL scheme controls whether traffic between `mirrorsync` and the
+proxy is encrypted.
+
+Requirements:
+
+- `MIRRORSYNC_PROXY` uses the same URL format and validation rules as
+  proxy `url` fields.
+- Environment proxy configuration is read from the process environment at
+  startup and is not written back to the configuration file.
+- `plan` output identifies the effective proxy mode for each configured
+  source.
+- For an `https` proxy URL, the connection from `mirrorsync` to the proxy is
+  established with TLS.
+- For an `https` proxy URL, proxy TLS certificates are verified with the host
+  trust store.
+- For an `http` proxy URL, the connection from `mirrorsync` to the proxy is
+  plaintext and must not be wrapped in TLS.
+- For HTTPS source URLs, `mirrorsync` uses HTTP `CONNECT` through the proxy
+  connection, then performs the source TLS handshake through that tunnel.
+- When the proxy connection uses HTTP/2, `mirrorsync` still uses `CONNECT` for
+  HTTPS source URLs before establishing the source TLS connection inside the
+  tunnel.
+- For HTTP source URLs, `mirrorsync` sends absolute-form HTTP requests over
+  the proxy connection.
+- `mirrorsync` assumes the configured proxy supports both HTTPS upstreams via
+  `CONNECT` and plain HTTP upstream requests.
+- Proxy configuration does not change source ordering, signature verification,
+  checksum verification, or publishing semantics.
+- Proxy connection, authentication, proxy TLS, or `CONNECT` failures are
+  treated as source request failures and must include proxy context in error
+  output.
+
+## Network Connection Semantics
+
+`mirrorsync` must use persistent HTTP connections for outbound source requests
+when the source server or proxy permits reuse. It must prefer HTTP/2 over
+HTTP/1.1 when the remote endpoint supports HTTP/2.
+
+Requirements:
+
+- For TLS connections that carry HTTP requests, `mirrorsync` offers HTTP/2
+  before HTTP/1.1 with ALPN.
+- When ALPN negotiates HTTP/2, `mirrorsync` uses HTTP/2 for requests on that
+  connection.
+- When HTTP/2 is unavailable, rejected by ALPN, or fails before a request can
+  be sent, `mirrorsync` falls back to HTTP/1.1.
+- HTTPS source requests through a proxy prefer HTTP/2 for the source
+  connection inside the `CONNECT` tunnel when the source supports it.
+- HTTPS proxy connections prefer HTTP/2 for the proxy connection when the
+  proxy supports it.
+- Multiple established source TLS connections may each negotiate HTTP/2 and
+  carry concurrent download streams.
+- Plain HTTP connections use HTTP/1.1 unless a peer-supported HTTP/2 cleartext
+  mode is explicitly implemented.
+- Each configured source has an effective connection limit from source-level
+  `max_connections`, `sync.max_connections_per_source`, or the implementation
+  default when neither is set.
+- Direct source requests must not exceed the source's effective connection
+  limit for established connections to the source scheme, host, and port.
+- HTTPS source requests through a proxy must not exceed the source's effective
+  connection limit for established `CONNECT` tunnels with source TLS
+  connections to the source scheme, host, and port through the same proxy
+  endpoint.
+- A `CONNECT` tunnel that carries a source TLS connection counts as one
+  established source connection, regardless of whether the proxy connection
+  uses HTTP/1.1 or HTTP/2.
+- HTTP source requests through a proxy must not exceed the source's effective
+  connection limit for established proxy connections carrying requests for
+  that source, because `mirrorsync` does not establish a separate connection to
+  the source.
+- HTTP/2 request streams on an established source connection are used for
+  concurrent downloads and do not count as separate established source
+  connections.
+- When the source supports HTTP/2, `mirrorsync` may establish multiple source
+  connections up to the effective source connection limit and use HTTP/2
+  streams on each connection for downloads.
+- If the effective connection limit is reached, additional requests for that
+  source wait for an existing connection to become available or reusable
+  instead of opening another connection.
+- Direct source requests reuse idle connections for subsequent requests to the
+  same scheme, host, and port.
+- HTTP source requests through a proxy reuse idle connections to the same proxy
+  endpoint when the proxy permits reuse.
+- HTTPS source requests through a proxy reuse idle `CONNECT` tunnels for
+  subsequent requests to the same source scheme, host, and port through the
+  same proxy endpoint when the proxy and source permit reuse.
+- `mirrorsync` must not intentionally force `Connection: close` on normal
+  successful requests.
+- Response bodies are closed in a way that allows connection reuse after
+  successful and rejected downloads.
+- Connection reuse must respect server or proxy `Connection: close` behavior,
+  transport errors, TLS errors, and protocol limits.
+- Connection reuse is scoped to a single command execution; `mirrorsync` does
+  not persist connections across processes.
+- Rate limits apply to request starts and are independent of whether a reused
+  or newly opened connection carries the request.
+
+## Rate Limiting
+
+Rate limits constrain request starts, not response body throughput.
+
+Supported fields:
+
+- `requests_per_second`: maximum request starts per second for the scope.
+- `requests_per_second_per_host`: maximum request starts per second for each
+  host in the scope.
+- `burst`: maximum burst size for the scope.
+
+If no rate limit is configured, `mirrorsync` may issue requests up to the global
+sync concurrency limit.
+
+## APT Keyring Semantics
+
+APT repository signature verification uses the configured `keyring`.
+
+Requirements:
+
+- A local keyring path, whether configured as absolute or relative, is resolved
+  to an absolute path and passed to `gpgv` as trusted key material for that APT
+  repository.
+- Keyring paths must point to files that exist on the local filesystem.
+- Keyring paths must not use URL schemes such as `https://` or `file://`.
+- If the keyring cannot be resolved, read, or passed to `gpgv`, the affected
+  APT repository sync fails before metadata verification.
+
+### APT Keyring Examples
+
+Absolute local path:
+
+```yaml
+apt:
+  repositories:
+    - name: ubuntu-absolute-keyring
+      publish_path: ubuntu-absolute
+      keyring: /etc/mirrorsync/keyrings/ubuntu-archive-keyring.gpg
+```
+
+Relative local path:
+
+```text
+/etc/mirrorsync/
+  config.yaml
+  keyrings/
+    ubuntu-archive-keyring.gpg
+```
+
+```yaml
+apt:
+  repositories:
+    - name: ubuntu-relative-keyring
+      publish_path: ubuntu-relative
+      keyring: keyrings/ubuntu-archive-keyring.gpg
+```
+
+When `-config /etc/mirrorsync/config.yaml` is used, the relative keyring path
+resolves to `/etc/mirrorsync/keyrings/ubuntu-archive-keyring.gpg`.
+
+## APT Repository Semantics
+
+For each configured APT suite, component, and architecture, `mirrorsync` must:
+
+- Fetch `InRelease` from `primary_source` when available.
+- Fall back to `Release` plus `Release.gpg` when `InRelease` is unavailable.
+- Verify upstream signatures with `gpgv` and the configured `keyring`.
+- Parse the verified `Release` metadata.
+- Download referenced `Packages.*` indexes from `primary_source`.
+- Verify each package index against hashes from the verified `Release` file.
+- Parse package entries for at least `Filename`, `Size`, and `SHA256`.
+- Download `.deb` payloads from `mirror_sources` in order.
+- Accept a `.deb` only when its size and SHA256 match the verified package
+  metadata.
+- Preserve upstream files under `dists/` unchanged in the published mirror.
+
+If a mirror source returns a missing, incomplete, or checksum-invalid payload,
+`mirrorsync` must reject that payload and try the next source. The sync fails
+only after all configured sources fail to provide a valid payload.
+
+## APK Repository Semantics
+
+For each configured Alpine version, repository, and architecture, `mirrorsync`
+must:
+
+- Fetch official `APKINDEX.tar.gz` from `primary_source`.
+- Verify the embedded APK index signature with keys from `keys_dir`.
+- Parse package names, versions, sizes, and checksums from the verified index.
+- Download `.apk` payloads from `mirror_sources` in order.
+- Accept an `.apk` only when it matches the verified APK index metadata.
+- Preserve upstream `APKINDEX.tar.gz` unchanged in the published mirror.
+
+If a mirror source returns a missing, incomplete, or checksum-invalid payload,
+`mirrorsync` must reject that payload and try the next source. The sync fails
+only after all configured sources fail to provide a valid payload.
+
+## Publishing Semantics
+
+Publishing must be atomic from a client consistency perspective.
+
+Requirements:
+
+- Each repository sync uses a per-repository lock.
+- Downloads are staged outside the active published tree.
+- Partial downloads are never served to clients.
+- Package payloads are published before metadata that references them.
+- Signed metadata is published last.
+- Metadata from failed sync attempts is not published.
+- Existing published metadata remains active when a sync fails before the
+  publish step.
+- Pruning runs only after new metadata is visible and must keep every file
+  referenced by current metadata.
+
+## Verification Semantics
+
+`verify` checks the published repository state without modifying it.
+
+For APT repositories, verification must confirm:
+
+- Published metadata signatures validate with the configured keyring.
+- Published package indexes match hashes in the verified `Release` metadata.
+- Referenced package files exist.
+- Referenced package files match expected size and SHA256.
+
+For APK repositories, verification must confirm:
+
+- Published `APKINDEX.tar.gz` validates with the configured keys.
+- Referenced package files exist.
+- Referenced package files match expected metadata from the verified index.
+
+## Failure Handling
+
+`mirrorsync` must fail safely.
+
+- Invalid configuration stops before network or filesystem mutation.
+- Signature verification failure stops the affected repository sync.
+- Checksum mismatch rejects the downloaded file.
+- A failed package download does not publish new metadata.
+- A failed publish leaves the last successfully published repository usable
+  whenever the underlying filesystem permits it.
+- Error output must identify the repository, file path or URL, source, and
+  verification step that failed.
+
+## Acceptance Criteria
+
+- APT clients can run `apt update` against the mirror using the original
+  `signed-by` keyring.
+- Alpine clients can run `apk update` against the mirror using the original
+  Alpine keys.
+- APT keyring paths must refer to existing local files; URL keyrings are
+  rejected.
+- An APT repository can verify upstream metadata with a relative keyring path
+  resolved from the configuration file directory.
+- Configuration validation rejects duplicate publish paths after resolving
+  them to absolute paths under `storage.root`.
+- A stale or incomplete local mirror source does not corrupt the published
+  mirror; valid payloads are fetched from later sources.
+- When an HTTPS proxy URL is configured, traffic between `mirrorsync` and the
+  proxy is encrypted for both HTTP and HTTPS source URLs.
+- When an HTTP proxy URL is configured, traffic between `mirrorsync` and the
+  proxy is not encrypted by the proxy connection.
+- A source-level proxy URL overrides `sync.proxy` and `MIRRORSYNC_PROXY` for
+  that source.
+- A source-level `mode: direct` bypasses inherited `sync.proxy` and
+  `MIRRORSYNC_PROXY` settings for that source.
+- When source-level proxy configuration and `sync.proxy` are unset and
+  `MIRRORSYNC_PROXY` is set, `mirrorsync` uses the proxy from the environment
+  variable.
+- HTTPS source URLs work through the configured proxy by using `CONNECT`.
+- Repeated requests to the same source or proxy reuse existing connections when
+  the peer permits keep-alive.
+- Source connection limits prevent `mirrorsync` from opening more than the
+  configured number of established connections for a source.
+- HTTP/2 downloads use streams on established source connections, and
+  `mirrorsync` may maintain multiple HTTP/2 source connections up to the
+  configured source connection limit.
+- HTTPS sources and HTTPS proxies use HTTP/2 instead of HTTP/1.1 when ALPN
+  negotiation selects HTTP/2.
+- Corrupt partial downloads are never accepted.
+- Metadata is not published before every referenced package file is present.
+- Prune keeps all files referenced by current metadata.
+- `plan` reports intended actions without changing the publish tree.
+- `verify` detects missing or checksum-invalid published package files.

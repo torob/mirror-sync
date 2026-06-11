@@ -6,13 +6,14 @@ storage:
 
 sync:
   concurrency: 4
-  retries: 2
   prune: true
-  max_connections_per_source: 2
-  rate_limit:
-    requests_per_second: 5
-    requests_per_second_per_host: 5
-    burst: 5
+  download:
+    retries: 2
+    max_connections_per_source: 2
+    rate_limit:
+      requests_per_second: 5
+      requests_per_second_per_host: 5
+      burst: 5
 
 apt:
   repositories:

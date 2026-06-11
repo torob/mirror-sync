@@ -565,6 +565,7 @@ Requirements:
   concurrently when concurrency limits permit it.
 - A repository sync must hold that repository's per-repository lock before
   mutating its staging or published paths.
+- Repository lock files must be stored outside the published repository tree.
 - Two sync operations for the same repository must not overlap.
 - Publishing atomicity is scoped per repository; one repository may publish
   successfully while another repository in the same sync cycle fails.
@@ -580,8 +581,14 @@ Publishing must be atomic from a client consistency perspective.
 Requirements:
 
 - Each repository sync uses a per-repository lock.
+- Lock files, temporary files, journals, state files, and other internal
+  coordination artifacts must not be created inside a published repository
+  directory.
 - Downloads are staged outside the active published tree.
 - Partial downloads are never served to clients.
+- During sync and prune, the only files that may be added, updated, or deleted
+  under a published repository directory are upstream repository files that
+  clients are expected to fetch.
 - Package payloads are published before metadata that references them.
 - Signed metadata is published last.
 - Metadata from failed sync attempts is not published.
@@ -645,6 +652,9 @@ For APK repositories, verification must confirm:
 - Multiple configured repositories may sync in parallel within one sync cycle,
   bounded by the effective repository concurrency limit and source limits.
 - Sync operations for the same configured repository do not overlap.
+- Published repository directories contain only repository files; lock files
+  and other `mirrorsync` internal artifacts are stored outside the publish
+  tree.
 - APT clients can run `apt update` against the mirror using the original
   `signed-by` keyring.
 - Alpine clients can run `apk update` against the mirror using the original

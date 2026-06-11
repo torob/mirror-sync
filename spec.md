@@ -19,11 +19,11 @@ signatures and never rewrites or re-signs repository metadata.
 
 - Mirror APT and Alpine APK repositories into a local served directory.
 - Treat `primary_source` as authoritative for signed metadata.
-- Download package payloads from ordered `mirror_sources`.
+- Download package payloads from ordered `mirror_sources` when configured.
 - Verify every package payload against checksums and sizes from upstream
   metadata before publishing it.
-- Fall back to `primary_source` when mirrors are missing packages, return
-  errors, or provide invalid payloads.
+- Fall back to `primary_source` when configured mirrors are missing packages,
+  return errors, or provide invalid payloads.
 - Publish package files before signed metadata so clients never observe
   metadata that references unavailable package files.
 - Support pruning files that are not referenced by current published metadata.
@@ -166,9 +166,15 @@ apk:
   paths during configuration validation.
 - Local APT keyring paths must exist and be readable before APT metadata is
   fetched.
-- `mirror_sources` are attempted in declaration order for package payloads.
-- `primary_source` may also appear in `mirror_sources` to provide an explicit
-  final fallback.
+- `mirror_sources` is optional and may be omitted or configured as an empty
+  list.
+- `mirror_sources` are attempted in declaration order for package payloads when
+  configured.
+- When `mirror_sources` is omitted or empty, package payloads are downloaded
+  from `primary_source`.
+- The same URL used in `primary_source.url` may also appear in
+  `mirror_sources` to provide an explicit fallback position in the source
+  order.
 - Source-level rate limits override repository-level limits.
 - Repository-level rate limits override global limits.
 - Missing optional rate-limit fields inherit from the next broader scope.
@@ -372,7 +378,8 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 - Download referenced `Packages.*` indexes from `primary_source`.
 - Verify each package index against hashes from the verified `Release` file.
 - Parse package entries for at least `Filename`, `Size`, and `SHA256`.
-- Download `.deb` payloads from `mirror_sources` in order.
+- Download `.deb` payloads from `mirror_sources` in order when configured,
+  otherwise from `primary_source`.
 - Accept a `.deb` only when its size and SHA256 match the verified package
   metadata.
 - Preserve upstream files under `dists/` unchanged in the published mirror.
@@ -389,7 +396,8 @@ must:
 - Fetch official `APKINDEX.tar.gz` from `primary_source`.
 - Verify the embedded APK index signature in-process with keys from `keys_dir`.
 - Parse package names, versions, sizes, and checksums from the verified index.
-- Download `.apk` payloads from `mirror_sources` in order.
+- Download `.apk` payloads from `mirror_sources` in order when configured,
+  otherwise from `primary_source`.
 - Accept an `.apk` only when it matches the verified APK index metadata.
 - Preserve upstream `APKINDEX.tar.gz` unchanged in the published mirror.
 

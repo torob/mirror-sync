@@ -203,6 +203,11 @@ apk:
 - `storage.root` is the served mirror root.
 - `storage.staging` is used for temporary downloads and must not be inside a
   client-visible repository path unless it is hidden from clients.
+- `storage.staging` is the default location for internal sync state such as
+  per-repository lock files.
+- `storage.staging` and `storage.root` must be on the same filesystem so
+  verified package payloads can be moved into the published tree with atomic,
+  metadata-only rename operations.
 - `publish_path` is relative to `storage.root`.
 - `publish_path` must not be absolute and must not escape `storage.root`.
 - Each configured `publish_path` is resolved against `storage.root`, cleaned,
@@ -441,6 +446,12 @@ Requirements:
   the whole payload into memory.
 - A checksum-invalid, size-invalid, incomplete, or otherwise rejected payload
   is removed from staging before the next source is attempted.
+- After a package payload is fully downloaded and verified, it may be moved
+  from staging into its final published path before the rest of the sync cycle
+  completes.
+- Moving a verified package payload from staging to the published tree must use
+  an atomic rename on the same filesystem. Cross-filesystem copy-and-delete
+  moves must not be used for publishing verified payloads.
 - Metadata files and package indexes may be buffered in memory when their
   expected size is small enough for normal repository metadata processing, but
   package payload memory usage must remain bounded by buffer size and
@@ -566,6 +577,10 @@ Requirements:
 - A repository sync must hold that repository's per-repository lock before
   mutating its staging or published paths.
 - Repository lock files must be stored outside the published repository tree.
+- Repository lock files should be stored under `storage.staging/locks/` unless
+  an implementation provides another non-published internal state directory.
+- Lock file paths must be derived from validated repository identity and must
+  not allow repository names or publish paths to escape the lock directory.
 - Two sync operations for the same repository must not overlap.
 - Publishing atomicity is scoped per repository; one repository may publish
   successfully while another repository in the same sync cycle fails.
@@ -589,6 +604,13 @@ Requirements:
 - During sync and prune, the only files that may be added, updated, or deleted
   under a published repository directory are upstream repository files that
   clients are expected to fetch.
+- A verified package payload may be published as soon as that individual
+  payload has been completely downloaded and verified.
+- It is safe for clients to observe extra valid package payloads that are not
+  referenced by the currently published metadata.
+- Metadata is staged separately and must not be published until every package
+  payload referenced by that metadata is present and verified in the published
+  tree.
 - Package payloads are published before metadata that references them.
 - Signed metadata is published last.
 - Metadata from failed sync attempts is not published.
@@ -689,6 +711,8 @@ For APK repositories, verification must confirm:
 - HTTPS sources and HTTPS proxies use HTTP/2 instead of HTTP/1.1 when ALPN
   negotiation selects HTTP/2.
 - Corrupt partial downloads are never accepted.
+- Verified package payloads are moved from staging to the published tree with
+  atomic same-filesystem renames, not cross-filesystem copy-and-delete moves.
 - Metadata is not published before every referenced package file is present.
 - Prune keeps all files referenced by current metadata.
 - `plan` reports intended actions without changing the publish tree.

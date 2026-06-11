@@ -408,6 +408,27 @@ Requirements:
 - Rate limits apply to request starts and are independent of whether a reused
   or newly opened connection carries the request.
 
+## Download Semantics
+
+Package payload downloads must be streamed to staging storage while checksums
+and sizes are computed incrementally. `mirrorsync` must not read a complete
+package payload into memory before writing it to disk or before checksum
+verification.
+
+Requirements:
+
+- `.deb` and `.apk` payload downloads are copied from the response body to a
+  temporary staging file using bounded-size buffers.
+- Size and checksum verification for package payloads is performed while
+  streaming the response body or by streaming the staged file, not by loading
+  the whole payload into memory.
+- A checksum-invalid, size-invalid, incomplete, or otherwise rejected payload
+  is removed from staging before the next source is attempted.
+- Metadata files and package indexes may be buffered in memory when their
+  expected size is small enough for normal repository metadata processing, but
+  package payload memory usage must remain bounded by buffer size and
+  concurrency.
+
 ## Rate Limiting
 
 Rate limits constrain request starts, not response body throughput.
@@ -591,6 +612,8 @@ For APK repositories, verification must confirm:
   implementation uses third-party Go packages.
 - The Go implementation is split into focused files or packages by
   responsibility and does not put all runtime code in one source file.
+- Package payload downloads are streamed with bounded memory usage and are not
+  stored entirely in memory before being staged or verified.
 - `mirrorsync run` performs periodic sync cycles using its built-in scheduler
   and does not require cron, systemd timers, shell loops, or other external
   schedulers.

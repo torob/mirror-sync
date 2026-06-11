@@ -589,6 +589,12 @@ Requirements:
   concurrently when concurrency limits permit it.
 - A repository sync must hold that repository's per-repository lock before
   mutating its staging or published paths.
+- Repository locks must use OS-backed advisory file locking, such as `flock`
+  or `fcntl` on Unix-like systems, on an opened lock file.
+- The existence of a lock file on disk must not by itself be treated as an
+  active lock. After a crash or power loss, a stale lock file may remain, and a
+  later `mirrorsync` process must be able to acquire the OS advisory lock on
+  that file when no live process holds it.
 - Repository lock files must be stored outside the published repository tree.
 - Repository lock files should be stored under `storage.staging/locks/` unless
   an implementation provides another non-published internal state directory.
@@ -656,6 +662,8 @@ For APK repositories, verification must confirm:
 - Invalid configuration stops before network or filesystem mutation.
 - Signature verification failure stops the affected repository sync.
 - Checksum mismatch rejects the downloaded file.
+- Stale lock files left by crashed or killed processes do not block future
+  syncs when no OS advisory lock is held.
 - A failed package download does not publish new metadata.
 - A failed publish leaves the last successfully published repository usable
   whenever the underlying filesystem permits it.
@@ -687,6 +695,8 @@ For APK repositories, verification must confirm:
 - Multiple configured repositories may sync in parallel within one sync cycle,
   bounded by the effective repository concurrency limit and source limits.
 - Sync operations for the same configured repository do not overlap.
+- Per-repository locking is enforced with OS advisory file locks; stale lock
+  files without an active OS lock do not block subsequent syncs.
 - Published repository directories contain only repository files; lock files
   and other `mirrorsync` internal artifacts are stored outside the publish
   tree.

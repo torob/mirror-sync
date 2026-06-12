@@ -14,7 +14,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"mirrorsync/internal/config"
+	"github.com/torob/mirror-sync/internal/config"
 )
 
 type Factory struct {

@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"mirrorsync/internal/model"
-	"mirrorsync/internal/safe"
+	"github.com/torob/mirror-sync/internal/model"
+	"github.com/torob/mirror-sync/internal/safe"
 )
 
 type Lock struct {

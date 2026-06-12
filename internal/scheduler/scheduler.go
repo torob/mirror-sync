@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"mirrorsync/internal/config"
+	"github.com/torob/mirror-sync/internal/config"
 )
 
 type Schedule interface {

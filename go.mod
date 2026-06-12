@@ -1,4 +1,4 @@
-module mirrorsync
+module github.com/torob/mirror-sync
 
 go 1.26
 

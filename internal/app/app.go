@@ -9,12 +9,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"mirrorsync/internal/apk"
-	"mirrorsync/internal/apt"
-	"mirrorsync/internal/config"
-	"mirrorsync/internal/httpx"
-	"mirrorsync/internal/model"
-	"mirrorsync/internal/scheduler"
+	"github.com/torob/mirror-sync/internal/apk"
+	"github.com/torob/mirror-sync/internal/apt"
+	"github.com/torob/mirror-sync/internal/config"
+	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/model"
+	"github.com/torob/mirror-sync/internal/scheduler"
 )
 
 type App struct {

@@ -1,0 +1,10 @@
+.git
+.github
+.e2e
+.staging
+bin
+dist
+mirrors
+coverage.out
+*.test
+mirrorsync

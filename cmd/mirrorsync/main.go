@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"mirrorsync/internal/app"
-	"mirrorsync/internal/config"
+	"github.com/torob/mirror-sync/internal/app"
+	"github.com/torob/mirror-sync/internal/config"
 )
 
 func main() {

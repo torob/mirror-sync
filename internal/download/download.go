@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"mirrorsync/internal/httpx"
-	"mirrorsync/internal/publish"
-	"mirrorsync/internal/safe"
+	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/publish"
+	"github.com/torob/mirror-sync/internal/safe"
 )
 
 type Expected struct {

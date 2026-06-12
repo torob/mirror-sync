@@ -19,12 +19,12 @@ import (
 	"strconv"
 	"strings"
 
-	"mirrorsync/internal/config"
-	"mirrorsync/internal/download"
-	"mirrorsync/internal/httpx"
-	"mirrorsync/internal/model"
-	"mirrorsync/internal/publish"
-	"mirrorsync/internal/safe"
+	"github.com/torob/mirror-sync/internal/config"
+	"github.com/torob/mirror-sync/internal/download"
+	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/model"
+	"github.com/torob/mirror-sync/internal/publish"
+	"github.com/torob/mirror-sync/internal/safe"
 )
 
 type Runner struct {

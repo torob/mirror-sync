@@ -1,18 +1,20 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultConcurrency = 4
+const DefaultMaxInFlightRequests = 4
 const DefaultMaxConnectionsPerSource = 4
 
 type Config struct {
@@ -30,10 +32,9 @@ type Storage struct {
 }
 
 type Sync struct {
-	Concurrency int      `yaml:"concurrency"`
-	Prune       bool     `yaml:"prune"`
-	Schedule    Schedule `yaml:"schedule"`
-	Download    Download `yaml:"download"`
+	Prune    bool     `yaml:"prune"`
+	Schedule Schedule `yaml:"schedule"`
+	Download Download `yaml:"download"`
 }
 
 type Schedule struct {
@@ -43,16 +44,11 @@ type Schedule struct {
 }
 
 type Download struct {
-	Retries                 int       `yaml:"retries"`
-	MaxConnectionsPerSource int       `yaml:"max_connections_per_source"`
-	Proxy                   Proxy     `yaml:"proxy"`
-	RateLimit               RateLimit `yaml:"rate_limit"`
-}
-
-type RateLimit struct {
-	RequestsPerSecond        float64 `yaml:"requests_per_second"`
-	RequestsPerSecondPerHost float64 `yaml:"requests_per_second_per_host"`
-	Burst                    int     `yaml:"burst"`
+	Retries                      int   `yaml:"retries"`
+	MaxConnectionsPerSource      int   `yaml:"max_connections_per_source"`
+	MaxInFlightRequests          int   `yaml:"max_in_flight_requests"`
+	MaxInFlightRequestsPerSource int   `yaml:"max_in_flight_requests_per_source"`
+	Proxy                        Proxy `yaml:"proxy"`
 }
 
 type Proxy struct {
@@ -61,10 +57,10 @@ type Proxy struct {
 }
 
 type Source struct {
-	URL            string    `yaml:"url"`
-	MaxConnections int       `yaml:"max_connections"`
-	Proxy          Proxy     `yaml:"proxy"`
-	RateLimit      RateLimit `yaml:"rate_limit"`
+	URL                 string `yaml:"url"`
+	MaxConnections      int    `yaml:"max_connections"`
+	MaxInFlightRequests int    `yaml:"max_in_flight_requests"`
+	Proxy               Proxy  `yaml:"proxy"`
 }
 
 type APTSection struct {
@@ -124,15 +120,15 @@ const (
 )
 
 type EffectiveSource struct {
-	RepoName       string
-	RepoKind       RepoKind
-	Role           SourceRole
-	Index          int
-	URL            string
-	ProxyURL       string
-	DirectProxy    bool
-	MaxConnections int
-	RateLimit      RateLimit
+	RepoName            string
+	RepoKind            RepoKind
+	Role                SourceRole
+	Index               int
+	URL                 string
+	ProxyURL            string
+	DirectProxy         bool
+	MaxConnections      int
+	MaxInFlightRequests int
 }
 
 func Load(path string) (*Config, error) {
@@ -148,7 +144,12 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	if err := rejectExplicitZeroLimits(data); err != nil {
 		return nil, err
 	}
 	cfg.ConfigDir = filepath.Dir(absConfig)
@@ -156,6 +157,107 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func rejectExplicitZeroLimits(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	root := documentRoot(&doc)
+	for _, path := range []struct {
+		keys  []string
+		label string
+	}{
+		{[]string{"sync", "download", "max_connections_per_source"}, "sync.download.max_connections_per_source"},
+		{[]string{"sync", "download", "max_in_flight_requests"}, "sync.download.max_in_flight_requests"},
+		{[]string{"sync", "download", "max_in_flight_requests_per_source"}, "sync.download.max_in_flight_requests_per_source"},
+	} {
+		if err := rejectZeroNode(mappingPath(root, path.keys...), path.label); err != nil {
+			return err
+		}
+	}
+	for _, section := range []string{"apt", "apk"} {
+		repos := mappingValue(mappingValue(root, section), "repositories")
+		if repos == nil || repos.Kind != yaml.SequenceNode {
+			continue
+		}
+		for i, repo := range repos.Content {
+			prefix := fmt.Sprintf("%s.repositories[%d]", section, i)
+			if err := rejectZeroSourceLimits(mappingValue(repo, "primary_source"), prefix+".primary_source"); err != nil {
+				return err
+			}
+			mirrors := mappingValue(repo, "mirror_sources")
+			if mirrors == nil || mirrors.Kind != yaml.SequenceNode {
+				continue
+			}
+			for j, mirror := range mirrors.Content {
+				if err := rejectZeroSourceLimits(mirror, fmt.Sprintf("%s.mirror_sources[%d]", prefix, j)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func rejectZeroSourceLimits(src *yaml.Node, label string) error {
+	if src == nil {
+		return nil
+	}
+	for _, field := range []string{"max_connections", "max_in_flight_requests"} {
+		if err := rejectZeroNode(mappingValue(src, field), label+"."+field); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectZeroNode(node *yaml.Node, label string) error {
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return nil
+	}
+	value, err := strconv.ParseInt(node.Value, 0, 64)
+	if err != nil {
+		return nil
+	}
+	if value == 0 {
+		return fmt.Errorf("%s must be positive when set", label)
+	}
+	return nil
+}
+
+func documentRoot(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return node.Content[0]
+	}
+	return node
+}
+
+func mappingPath(node *yaml.Node, keys ...string) *yaml.Node {
+	cur := node
+	for _, key := range keys {
+		cur = mappingValue(cur, key)
+		if cur == nil {
+			return nil
+		}
+	}
+	return cur
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 func (c *Config) validate() error {
@@ -171,14 +273,17 @@ func (c *Config) validate() error {
 	if err != nil {
 		return fmt.Errorf("storage.staging: %w", err)
 	}
-	if c.Sync.Concurrency < 0 {
-		return fmt.Errorf("sync.concurrency must be positive")
-	}
 	if c.Sync.Download.Retries < 0 {
 		return fmt.Errorf("sync.download.retries must be non-negative")
 	}
 	if c.Sync.Download.MaxConnectionsPerSource < 0 {
-		return fmt.Errorf("sync.download.max_connections_per_source must be positive")
+		return fmt.Errorf("sync.download.max_connections_per_source must be non-negative")
+	}
+	if c.Sync.Download.MaxInFlightRequests < 0 {
+		return fmt.Errorf("sync.download.max_in_flight_requests must be non-negative")
+	}
+	if c.Sync.Download.MaxInFlightRequestsPerSource < 0 {
+		return fmt.Errorf("sync.download.max_in_flight_requests_per_source must be non-negative")
 	}
 	if err := validateProxy(c.Sync.Download.Proxy); err != nil {
 		return fmt.Errorf("sync.download.proxy: %w", err)
@@ -347,7 +452,10 @@ func validateHTTPSource(src Source) error {
 		return errors.New("url must use http or https")
 	}
 	if src.MaxConnections < 0 {
-		return errors.New("max_connections must be positive")
+		return errors.New("max_connections must be non-negative")
+	}
+	if src.MaxInFlightRequests < 0 {
+		return errors.New("max_in_flight_requests must be non-negative")
 	}
 	return validateProxy(src.Proxy)
 }
@@ -373,18 +481,18 @@ func validateProxy(p Proxy) error {
 	return nil
 }
 
-func (c *Config) Concurrency() int {
-	if c.Sync.Concurrency > 0 {
-		return c.Sync.Concurrency
-	}
-	return DefaultConcurrency
-}
-
 func (c *Config) Retries() int {
 	return c.Sync.Download.Retries
 }
 
-func (c *Config) Source(repoName string, kind RepoKind, role SourceRole, index int, src Source, repoLimit RateLimit) (EffectiveSource, error) {
+func (c *Config) MaxInFlightRequests() int {
+	if c.Sync.Download.MaxInFlightRequests > 0 {
+		return c.Sync.Download.MaxInFlightRequests
+	}
+	return DefaultMaxInFlightRequests
+}
+
+func (c *Config) Source(repoName string, kind RepoKind, role SourceRole, index int, src Source) (EffectiveSource, error) {
 	proxyURL, direct, err := c.resolveProxy(src.Proxy)
 	if err != nil {
 		return EffectiveSource{}, err
@@ -396,11 +504,40 @@ func (c *Config) Source(repoName string, kind RepoKind, role SourceRole, index i
 	if maxConns == 0 {
 		maxConns = DefaultMaxConnectionsPerSource
 	}
-	limit := inheritRateLimit(src.RateLimit, repoLimit, c.Sync.Download.RateLimit)
+	maxInFlight := src.MaxInFlightRequests
+	if maxInFlight == 0 {
+		maxInFlight = c.Sync.Download.MaxInFlightRequestsPerSource
+	}
+	if maxInFlight == 0 {
+		maxInFlight = c.MaxInFlightRequests()
+	}
 	return EffectiveSource{
 		RepoName: repoName, RepoKind: kind, Role: role, Index: index, URL: strings.TrimRight(src.URL, "/"),
-		ProxyURL: proxyURL, DirectProxy: direct, MaxConnections: maxConns, RateLimit: limit,
+		ProxyURL: proxyURL, DirectProxy: direct, MaxConnections: maxConns, MaxInFlightRequests: maxInFlight,
 	}, nil
+}
+
+func (c *Config) PayloadSources(repoName string, kind RepoKind, primary Source, mirrors []Source) ([]EffectiveSource, error) {
+	primaryEff, err := c.Source(repoName, kind, SourcePrimary, 0, primary)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EffectiveSource, 0, len(mirrors)+1)
+	hasPrimaryURL := false
+	for i, mirror := range mirrors {
+		eff, err := c.Source(repoName, kind, SourceMirror, i, mirror)
+		if err != nil {
+			return nil, err
+		}
+		if eff.URL == primaryEff.URL {
+			hasPrimaryURL = true
+		}
+		out = append(out, eff)
+	}
+	if !hasPrimaryURL {
+		out = append(out, primaryEff)
+	}
+	return out, nil
 }
 
 func (c *Config) resolveProxy(src Proxy) (string, bool, error) {
@@ -424,20 +561,4 @@ func (c *Config) resolveProxy(src Proxy) (string, bool, error) {
 		return "", false, fmt.Errorf("MIRRORSYNC_PROXY: %w", err)
 	}
 	return env, false, nil
-}
-
-func inheritRateLimit(scopes ...RateLimit) RateLimit {
-	var out RateLimit
-	for _, r := range scopes {
-		if out.RequestsPerSecond == 0 {
-			out.RequestsPerSecond = r.RequestsPerSecond
-		}
-		if out.RequestsPerSecondPerHost == 0 {
-			out.RequestsPerSecondPerHost = r.RequestsPerSecondPerHost
-		}
-		if out.Burst == 0 {
-			out.Burst = r.Burst
-		}
-	}
-	return out
 }

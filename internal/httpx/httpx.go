@@ -12,30 +12,31 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/time/rate"
-
 	"github.com/torob/mirror-sync/internal/config"
+	"github.com/torob/mirror-sync/internal/limit"
 )
 
 type Factory struct {
-	mu      sync.Mutex
-	clients map[string]*Client
-	retries int
+	mu            sync.Mutex
+	clients       map[string]*Client
+	retries       int
+	globalLimiter *limit.Limiter
 }
 
 type Client struct {
-	source  config.EffectiveSource
-	client  *http.Client
-	limiter *rate.Limiter
-	retries int
+	source        config.EffectiveSource
+	client        *http.Client
+	sourceLimiter *limit.Limiter
+	globalLimiter *limit.Limiter
+	retries       int
 }
 
-func NewFactory(retries int) *Factory {
-	return &Factory{clients: map[string]*Client{}, retries: retries}
+func NewFactory(retries int, globalLimiter *limit.Limiter) *Factory {
+	return &Factory{clients: map[string]*Client{}, retries: retries, globalLimiter: globalLimiter}
 }
 
 func (f *Factory) Client(src config.EffectiveSource) (*Client, error) {
-	key := fmt.Sprintf("%s|%s|%t|%d", src.URL, src.ProxyURL, src.DirectProxy, src.MaxConnections)
+	key := fmt.Sprintf("%s|%s|%t|%d|%d", src.URL, src.ProxyURL, src.DirectProxy, src.MaxConnections, src.MaxInFlightRequests)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c := f.clients[key]; c != nil {
@@ -45,22 +46,15 @@ func (f *Factory) Client(src config.EffectiveSource) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	var limiter *rate.Limiter
-	if src.RateLimit.RequestsPerSecond > 0 {
-		burst := src.RateLimit.Burst
-		if burst <= 0 {
-			burst = 1
-		}
-		limiter = rate.NewLimiter(rate.Limit(src.RateLimit.RequestsPerSecond), burst)
-	}
 	c := &Client{
 		source: src,
 		client: &http.Client{
 			Transport: tr,
 			Timeout:   0,
 		},
-		limiter: limiter,
-		retries: f.retries,
+		sourceLimiter: limit.New(src.MaxInFlightRequests),
+		globalLimiter: f.globalLimiter,
+		retries:       f.retries,
 	}
 	f.clients[key] = c
 	return c, nil
@@ -116,20 +110,28 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 	url := c.URL(rel)
 	var last error
 	for attempt := 0; attempt <= c.retries; attempt++ {
-		if c.limiter != nil {
-			if err := c.limiter.Wait(ctx); err != nil {
-				return err
-			}
-		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return err
 		}
+		releaseSource, err := c.sourceLimiter.Acquire(ctx)
+		if err != nil {
+			return err
+		}
+		releaseGlobal, err := c.globalLimiter.Acquire(ctx)
+		if err != nil {
+			releaseSource()
+			return err
+		}
 		resp, err := c.client.Do(req)
 		if err != nil {
+			releaseGlobal()
+			releaseSource()
 			last = fmt.Errorf("%s request %s via %s failed: %w", c.source.RepoName, url, c.ProxyMode(), err)
 		} else {
 			err = func() error {
+				defer releaseSource()
+				defer releaseGlobal()
 				defer resp.Body.Close()
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 					io.Copy(io.Discard, resp.Body)

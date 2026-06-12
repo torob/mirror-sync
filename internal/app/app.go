@@ -13,6 +13,7 @@ import (
 	"github.com/torob/mirror-sync/internal/apt"
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/limit"
 	"github.com/torob/mirror-sync/internal/model"
 	"github.com/torob/mirror-sync/internal/scheduler"
 )
@@ -23,7 +24,7 @@ type App struct {
 }
 
 func New(cfg *config.Config) *App {
-	return &App{Config: cfg, HTTP: httpx.NewFactory(cfg.Retries())}
+	return &App{Config: cfg, HTTP: httpx.NewFactory(cfg.Retries(), limit.New(cfg.MaxInFlightRequests()))}
 }
 
 func (a *App) Plan(ctx context.Context) error {
@@ -116,17 +117,10 @@ func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) 
 
 func (a *App) eachRepo(ctx context.Context, fn func(context.Context, repoRunner) error) error {
 	runners := a.repoRunners()
-	sem := make(chan struct{}, a.Config.Concurrency())
 	g, ctx := errgroup.WithContext(ctx)
 	for _, runner := range runners {
 		runner := runner
 		g.Go(func() error {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return ctx.Err()
-			}
 			return fn(ctx, runner)
 		})
 	}

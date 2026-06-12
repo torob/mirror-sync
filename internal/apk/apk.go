@@ -63,18 +63,19 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var expected []download.Expected
 	for _, pkg := range sortedPackages(state.Packages) {
 		pkg := pkg
-		err := download.Ensure(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, download.Expected{
+		expected = append(expected, download.Expected{
 			RelPath: pkg.Path,
 			Size:    pkg.Size,
 			Verify: func(path string) error {
 				return verifyAPKPayload(path, pkg.APKHash)
 			},
 		})
-		if err != nil {
-			return fmt.Errorf("apk %s package %s: %w", r.Repo.Name, pkg.Path, err)
-		}
+	}
+	if err := download.EnsureMany(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, expected); err != nil {
+		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
 	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), state.Metadata); err != nil {
 		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
@@ -128,7 +129,7 @@ func (r *Runner) Prune(ctx context.Context) ([]string, error) {
 }
 
 func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) {
-	primary, err := r.Config.Source(r.Repo.Name, config.RepoAPK, config.SourcePrimary, 0, r.Repo.PrimarySource, config.RateLimit{})
+	primary, err := r.Config.Source(r.Repo.Name, config.RepoAPK, config.SourcePrimary, 0, r.Repo.PrimarySource)
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
@@ -405,16 +406,12 @@ func parseParagraph(text string) map[string]string {
 }
 
 func (r *Runner) payloadClients() ([]*httpx.Client, error) {
-	sources := r.Repo.MirrorSources
-	if len(sources) == 0 {
-		sources = []config.Source{r.Repo.PrimarySource}
+	sources, err := r.Config.PayloadSources(r.Repo.Name, config.RepoAPK, r.Repo.PrimarySource, r.Repo.MirrorSources)
+	if err != nil {
+		return nil, err
 	}
 	var out []*httpx.Client
-	for i, src := range sources {
-		eff, err := r.Config.Source(r.Repo.Name, config.RepoAPK, config.SourceMirror, i, src, config.RateLimit{})
-		if err != nil {
-			return nil, err
-		}
+	for _, eff := range sources {
 		client, err := r.HTTP.Client(eff)
 		if err != nil {
 			return nil, err
@@ -426,16 +423,16 @@ func (r *Runner) payloadClients() ([]*httpx.Client, error) {
 
 func (r *Runner) sourceDescriptions() []string {
 	var out []string
-	srcs := append([]config.Source{r.Repo.PrimarySource}, r.Repo.MirrorSources...)
-	for i, src := range srcs {
-		eff, err := r.Config.Source(r.Repo.Name, config.RepoAPK, config.SourceMirror, i, src, config.RateLimit{})
-		if err == nil {
-			mode := "direct"
-			if !eff.DirectProxy && eff.ProxyURL != "" {
-				mode = eff.ProxyURL
-			}
-			out = append(out, fmt.Sprintf("%s proxy=%s max_connections=%d", eff.URL, mode, eff.MaxConnections))
+	sources, err := r.Config.PayloadSources(r.Repo.Name, config.RepoAPK, r.Repo.PrimarySource, r.Repo.MirrorSources)
+	if err != nil {
+		return out
+	}
+	for _, eff := range sources {
+		mode := "direct"
+		if !eff.DirectProxy && eff.ProxyURL != "" {
+			mode = eff.ProxyURL
 		}
+		out = append(out, fmt.Sprintf("%s proxy=%s max_connections=%d max_in_flight_requests=%d", eff.URL, mode, eff.MaxConnections, eff.MaxInFlightRequests))
 	}
 	return out
 }

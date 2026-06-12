@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/torob/mirror-sync/internal/httpx"
 	"github.com/torob/mirror-sync/internal/publish"
 	"github.com/torob/mirror-sync/internal/safe"
@@ -22,6 +24,58 @@ type Expected struct {
 	Size    int64
 	SHA256  string
 	Verify  func(path string) error
+}
+
+func EnsureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+	workers := workerCount(clients, len(expected))
+	if workers == 0 {
+		return nil
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	jobs := make(chan Expected)
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			for exp := range jobs {
+				if err := Ensure(ctx, publishRoot, stagingRoot, clients, exp); err != nil {
+					return fmt.Errorf("package %s: %w", exp.RelPath, err)
+				}
+			}
+			return nil
+		})
+	}
+
+	for _, exp := range expected {
+		select {
+		case jobs <- exp:
+		case <-ctx.Done():
+			close(jobs)
+			return g.Wait()
+		}
+	}
+	close(jobs)
+	return g.Wait()
+}
+
+func workerCount(clients []*httpx.Client, expected int) int {
+	if expected == 0 {
+		return 0
+	}
+	workers := 0
+	for _, client := range clients {
+		limit := client.Source().MaxInFlightRequests
+		if limit <= 0 {
+			limit = 1
+		}
+		workers += limit
+	}
+	if workers == 0 {
+		workers = 1
+	}
+	if workers > expected {
+		return expected
+	}
+	return workers
 }
 
 func Ensure(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {

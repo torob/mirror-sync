@@ -5,15 +5,11 @@ storage:
   staging: .e2e/staged
 
 sync:
-  concurrency: 4
   prune: true
   download:
     retries: 2
     max_connections_per_source: 2
-    rate_limit:
-      requests_per_second: 5
-      requests_per_second_per_host: 5
-      burst: 5
+    max_in_flight_requests: 4
 
 apt:
   repositories:

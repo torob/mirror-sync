@@ -44,8 +44,8 @@ signatures and never rewrites or re-signs repository metadata.
 - `mirrorsync` does not generate, edit, or re-sign APK `APKINDEX.tar.gz`
   metadata.
 - `mirrorsync` does not provide snapshot retention in version 1.
-- `mirrorsync` does not throttle bandwidth; rate limits apply only to request
-  starts.
+- `mirrorsync` does not throttle bandwidth and does not provide requests-per-
+  second limiting in version 1.
 
 ## Limitations
 
@@ -70,8 +70,8 @@ Recommended package boundaries include:
 
 - Command-line entrypoint and command dispatch.
 - Configuration loading, normalization, and validation.
-- Outbound HTTP source clients, proxy resolution, rate limiting, retries, and
-  connection limit handling.
+- Outbound HTTP source clients, proxy resolution, retries, in-flight request
+  limits, and connection limit handling.
 - APT metadata fetching, OpenPGP verification, index parsing, and package
   verification.
 - APK index signature verification, APK metadata parsing, and package
@@ -141,51 +141,39 @@ storage:
   staging: /srv/mirrors/.staging
 
 sync:
-  concurrency: 16
   prune: true
   schedule:
     cron: "0 3 * * *"
     timezone: Asia/Tehran
   download:
     retries: 3
+    max_in_flight_requests: 16
     max_connections_per_source: 4
+    max_in_flight_requests_per_source: 4
     proxy:
       url: https://proxy.example.com:8443
-    rate_limit:
-      requests_per_second: 50
-      requests_per_second_per_host: 10
-      burst: 20
 
 apt:
   repositories:
     - name: ubuntu
       publish_path: ubuntu
       keyring: keyrings/ubuntu-archive-keyring.gpg
-      rate_limit:
-        requests_per_second: 30
-        burst: 50
       primary_source:
         url: https://archive.ubuntu.com/ubuntu
         max_connections: 2
+        max_in_flight_requests: 2
         proxy:
           url: https://metadata-proxy.example.com:8443
-        rate_limit:
-          requests_per_second: 5
-          burst: 10
       mirror_sources:
         - url: http://local-ubuntu-mirror.example.com/ubuntu
           max_connections: 8
+          max_in_flight_requests: 8
           proxy:
             mode: direct
-          rate_limit:
-            requests_per_second: 20
-            burst: 40
         - url: https://archive.ubuntu.com/ubuntu
+          max_in_flight_requests: 2
           proxy:
             url: http://fallback-proxy.example.com:8080
-          rate_limit:
-            requests_per_second: 5
-            burst: 10
       architectures: [amd64]
       suites:
         - name: noble
@@ -236,20 +224,17 @@ apk:
   fetched.
 - `mirror_sources` is optional and may be omitted or configured as an empty
   list.
-- `mirror_sources` are attempted in declaration order for package payloads when
-  configured.
-- When `mirror_sources` is omitted or empty, package payloads are downloaded
-  from `primary_source`.
-- The same URL used in `primary_source.url` may also appear in
-  `mirror_sources` to provide an explicit fallback position in the source
-  order.
-- Source-level rate limits override repository-level limits.
-- Repository-level rate limits override global download limits from
-  `sync.download.rate_limit`.
-- Missing optional rate-limit fields inherit from the next broader scope.
-- `sync.concurrency`, when set, must be a positive integer and bounds total
-  concurrent sync work across all configured repositories in each sync cycle,
-  including cycles started by `sync` and `run`.
+- Package payloads are downloaded from `mirror_sources` first, in declaration
+  order, when configured.
+- `primary_source` is always the final fallback source for package payloads.
+  When `mirror_sources` is omitted or empty, package payloads are downloaded
+  directly from `primary_source`.
+- If the same URL appears in both `mirror_sources` and `primary_source`, it
+  must not be tried twice for the same package payload.
+- `sync.download.max_in_flight_requests`, when set, must be a positive integer
+  and bounds total in-flight outbound source requests across all configured
+  repositories, sources, and packages in each sync cycle started by `sync` or
+  `run`.
 - `sync.schedule` configures built-in periodic execution for the `run`
   command.
 - `run` requires `sync.schedule` to specify exactly one schedule trigger:
@@ -280,7 +265,24 @@ apk:
 - Source-level `max_connections`, when set on `primary_source` or a
   `mirror_sources` entry, overrides
   `sync.download.max_connections_per_source` for that source.
-- Connection limit values must be positive integers.
+- There is no global established-connection limit. Total established
+  connections are constrained only by each source's effective connection
+  limit, the number of configured sources, operating-system limits, and remote
+  endpoint behavior.
+- `sync.download.max_in_flight_requests_per_source`, when set, is the default
+  maximum number of concurrent in-flight outbound requests for each configured
+  source.
+- Source-level `max_in_flight_requests`, when set on `primary_source` or a
+  `mirror_sources` entry, overrides
+  `sync.download.max_in_flight_requests_per_source` for that source.
+- `sync.download.max_in_flight_requests` is the global maximum number of
+  concurrent in-flight outbound source requests across all sources.
+- Connection and in-flight request limit values must be positive integers.
+- Package payload downloads for a single repository must be eligible to run
+  concurrently when more than one package is missing or invalid. They must not
+  be processed by an intentionally serial repository-local package loop when
+  global and per-source in-flight request limits and source connection limits
+  allow parallel work.
 - A proxy may be configured globally with `sync.download.proxy`, per source
   with `primary_source.proxy` or `mirror_sources[].proxy`, or globally from
   the `MIRRORSYNC_PROXY` environment variable.
@@ -324,7 +326,8 @@ Requirements:
   of a daylight-saving transition, `mirrorsync` starts that sync cycle at the
   next valid local time after the matched time.
 - Each scheduled cycle uses the same download, verification, publishing,
-  pruning, proxy, rate-limit, and connection-reuse semantics as `sync`.
+  pruning, proxy, in-flight request limit, and connection-reuse semantics as
+  `sync`.
 - Scheduled sync cycles must not overlap.
 - If a scheduled start time occurs while a sync cycle is still running,
   `mirrorsync` starts the next cycle only after the current cycle completes.
@@ -437,8 +440,6 @@ Requirements:
   transport errors, TLS errors, and protocol limits.
 - Connection reuse is scoped to a single command execution; `mirrorsync` does
   not persist connections across processes.
-- Rate limits apply to request starts and are independent of whether a reused
-  or newly opened connection carries the request.
 
 ## Download Semantics
 
@@ -472,27 +473,54 @@ Requirements:
 - After a package payload is fully downloaded and verified, it may be moved
   from staging into its final published path before the rest of the sync cycle
   completes.
+- After repository metadata has been fetched and verified, package payload
+  downloads for that repository run concurrently. The implementation must be
+  able to have multiple package payload requests in flight for the same
+  repository when there are multiple packages to fetch and the effective
+  global in-flight request limit, per-source in-flight request limit, and
+  source connection limits permit it.
+- Source fallback order is preserved independently for each package. If a
+  package payload fails from one configured source, the next source for that
+  same package is tried in declaration order, while other package payloads may
+  continue downloading concurrently.
+- A failed package download does not cancel unrelated in-flight package
+  downloads unless the enclosing sync context is canceled or the implementation
+  needs to fail the repository sync after all sources for that package have
+  been exhausted.
 - Moving a verified package payload from staging to the published tree must use
   an atomic rename on the same filesystem. Cross-filesystem copy-and-delete
   moves must not be used for publishing verified payloads.
 - Metadata files and package indexes may be buffered in memory when their
   expected size is small enough for normal repository metadata processing, but
   package payload memory usage must remain bounded by buffer size and
-  concurrency.
+  the number of concurrently streamed payloads.
 
-## Rate Limiting
+## In-Flight Request Limits
 
-Rate limits constrain request starts, not response body throughput.
+In-flight request limits constrain concurrent outbound source requests. They
+do not constrain request starts per second, response body throughput, or
+bandwidth.
 
 Supported fields:
 
-- `requests_per_second`: maximum request starts per second for the scope.
-- `requests_per_second_per_host`: maximum request starts per second for each
-  host in the scope.
-- `burst`: maximum burst size for the scope.
+- `sync.download.max_in_flight_requests`: global maximum in-flight outbound
+  source requests across all configured repositories, sources, and packages in
+  one sync cycle.
+- `sync.download.max_in_flight_requests_per_source`: default maximum
+  in-flight outbound source requests for each configured source.
+- Source-level `max_in_flight_requests`: maximum in-flight outbound requests
+  for one configured source, overriding the default.
 
-If no rate limit is configured, `mirrorsync` may issue requests up to the
-effective repository concurrency limit and applicable source connection limits.
+An outbound source request is in flight from the point where `mirrorsync` is
+ready to issue that request until the response body has been fully consumed or
+the request has failed and its response body, if any, has been closed.
+
+The effective concurrency for a source is bounded by both the global
+`sync.download.max_in_flight_requests` limit and that source's effective
+`max_in_flight_requests` limit. Established connection limits are applied
+separately and may impose a lower practical concurrency for HTTP/1.1 sources
+or for sources and proxies that do not support enough concurrent HTTP/2
+streams.
 
 ## APT Keyring Semantics
 
@@ -556,7 +584,7 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 - Verify each package index against hashes from the verified `Release` file.
 - Parse package entries for at least `Filename`, `Size`, and `SHA256`.
 - Download `.deb` payloads from `mirror_sources` in order when configured,
-  otherwise from `primary_source`.
+  then from `primary_source` as the final fallback.
 - Accept a `.deb` only when its size and SHA256 match the verified package
   metadata.
 - Preserve upstream files under `dists/` unchanged in the published mirror.
@@ -574,7 +602,7 @@ must:
 - Verify the embedded APK index signature in-process with keys from `keys_dir`.
 - Parse package names, versions, sizes, and checksums from the verified index.
 - Download `.apk` payloads from `mirror_sources` in order when configured,
-  otherwise from `primary_source`.
+  then from `primary_source` as the final fallback.
 - Accept an `.apk` only when it matches the verified APK index metadata.
 - Preserve upstream `APKINDEX.tar.gz` unchanged in the published mirror.
 
@@ -586,17 +614,34 @@ only after all configured sources fail to provide a valid payload.
 
 A sync cycle may process multiple configured repositories concurrently.
 Repository execution is not required to be serial unless constrained by
-the effective repository concurrency limit, source connection limits, rate
-limits, or per-repository locks.
+global in-flight request limits, per-source in-flight request limits, source
+connection limits, or per-repository locks.
 
 Requirements:
 
-- The effective repository concurrency limit bounds total concurrent sync work
-  across APT and APK repositories within a sync cycle.
-- The effective repository concurrency limit is `sync.concurrency` when
-  configured, otherwise the implementation default.
+- `sync.download.max_in_flight_requests` bounds total in-flight outbound
+  source requests across APT and APK repositories within a sync cycle.
+- Repository coordination goroutines that are waiting for work do not count as
+  in-flight source requests.
 - Different configured repositories may download, verify, stage, and publish
-  concurrently when concurrency limits permit it.
+  concurrently when in-flight request limits and source connection limits
+  permit it.
+- A single configured repository may download, verify, stage, and publish
+  multiple package payloads concurrently when in-flight request limits and
+  source connection limits permit it.
+  Repository-local package payload processing must not require one package to
+  finish before another package in the same repository can start.
+- Package payload scheduling must be bounded. An implementation must not start
+  one goroutine, thread, task, or equivalent execution unit per package when a
+  repository contains many packages. It should use a bounded worker pool or an
+  equivalent mechanism sized from available source request capacity, capped by
+  the number of pending packages.
+- For a repository with pending missing packages and available source capacity,
+  simultaneous package payload requests to one source may reach the lowest of
+  the global `sync.download.max_in_flight_requests` limit, the source's
+  effective `max_in_flight_requests` limit, and any practical concurrency
+  imposed by the source's effective connection limit and negotiated HTTP
+  protocol.
 - A repository sync must hold that repository's per-repository lock before
   mutating its staging or published paths.
 - Repository locks must use OS-backed advisory file locking, such as `flock`
@@ -713,7 +758,11 @@ For APK repositories, verification must confirm:
 - Scheduled sync cycles do not overlap, and a failed scheduled cycle does not
   stop later scheduled cycles.
 - Multiple configured repositories may sync in parallel within one sync cycle,
-  bounded by the effective repository concurrency limit and source limits.
+  bounded by global and per-source in-flight request limits, source connection
+  limits, and per-repository locks.
+- Multiple package payloads within the same configured repository may download
+  in parallel within one sync cycle, bounded by global and per-source
+  in-flight request limits and source connection limits.
 - Sync operations for the same configured repository do not overlap.
 - Per-repository locking is enforced with OS advisory file locks; stale lock
   files without an active OS lock do not block subsequent syncs.

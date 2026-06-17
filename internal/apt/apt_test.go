@@ -8,7 +8,7 @@ import (
 
 func TestSourceDescriptionsUsePayloadSourceOrder(t *testing.T) {
 	cfg := &config.Config{Sync: config.Sync{Download: config.Download{
-		Proxy:                        config.Proxy{URL: "http://global-proxy.example:8080"},
+		Proxy:                        config.GlobalProxy{URL: "http://global-proxy.example:8080"},
 		MaxConnectionsPerSource:      4,
 		MaxInFlightRequests:          12,
 		MaxInFlightRequestsPerSource: 5,
@@ -19,14 +19,14 @@ func TestSourceDescriptionsUsePayloadSourceOrder(t *testing.T) {
 			Name: "repo",
 			PrimarySource: config.Source{
 				URL:                 "https://primary.example/repo/",
-				Proxy:               config.Proxy{URL: "http://primary-proxy.example:8080"},
+				Proxy:               config.SourceProxy{URL: "http://primary-proxy.example:8080"},
 				MaxConnections:      2,
 				MaxInFlightRequests: 3,
 			},
 			MirrorSources: []config.Source{
 				{
 					URL:                 "https://mirror.example/repo",
-					Proxy:               config.Proxy{Mode: "direct"},
+					Proxy:               config.SourceProxy{Enabled: boolPtr(false)},
 					MaxConnections:      8,
 					MaxInFlightRequests: 9,
 				},
@@ -47,4 +47,8 @@ func TestSourceDescriptionsUsePayloadSourceOrder(t *testing.T) {
 			t.Fatalf("description[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }

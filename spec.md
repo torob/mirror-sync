@@ -152,6 +152,7 @@ sync:
     max_in_flight_requests_per_source: 4
     proxy:
       url: https://proxy.example.com:8443
+      enabled_by_default: false
 
 apt:
   repositories:
@@ -169,7 +170,7 @@ apt:
           max_connections: 8
           max_in_flight_requests: 8
           proxy:
-            mode: direct
+            enabled: true
         - url: https://archive.ubuntu.com/ubuntu
           max_in_flight_requests: 2
           proxy:
@@ -189,7 +190,7 @@ apk:
       mirror_sources:
         - url: http://local-alpine.example.com/alpine
           proxy:
-            mode: direct
+            enabled: true
         - url: https://dl-cdn.alpinelinux.org/alpine
       architectures: [x86_64]
       versions:
@@ -288,15 +289,22 @@ apk:
   the `MIRRORSYNC_PROXY` environment variable.
 - Proxy `url` values and `MIRRORSYNC_PROXY`, when set, must use the `http` or
   `https` scheme.
-- A proxy object must specify exactly one of `url` or `mode: direct`.
-- `mode: direct` disables proxy use for that scope.
+- `sync.download.proxy.enabled_by_default`, when omitted, defaults to `true`.
+- When `sync.download.proxy.enabled_by_default` is `true`, sources with no
+  source-level proxy configuration inherit `sync.download.proxy` or
+  `MIRRORSYNC_PROXY`.
+- When `sync.download.proxy.enabled_by_default` is `false`, sources with no
+  source-level proxy configuration use direct connections.
+- Source-level `proxy.enabled: true` explicitly enables inherited proxy use
+  for that source.
+- Source-level `proxy.enabled: false` explicitly disables inherited proxy use
+  for that source.
+- A source-level proxy object must specify only one of `url` or `enabled`.
 - Source-level proxy configuration takes precedence over `sync.download.proxy`.
 - `sync.download.proxy` takes precedence over `MIRRORSYNC_PROXY`.
 - An empty `MIRRORSYNC_PROXY` value is treated as unset.
-- Sources with no source-level proxy inherit `sync.download.proxy` when it is
-  set.
-- Sources with no source-level proxy and no `sync.download.proxy` inherit
-  `MIRRORSYNC_PROXY` when it is set.
+- Sources with no source-level proxy inherit `sync.download.proxy` or
+  `MIRRORSYNC_PROXY` only when proxy inheritance is enabled by default.
 - Sources with no source-level proxy, no `sync.download.proxy`, and no
   `MIRRORSYNC_PROXY` use direct connections.
 
@@ -787,11 +795,13 @@ For APK repositories, verification must confirm:
   proxy is not encrypted by the proxy connection.
 - A source-level proxy URL overrides `sync.download.proxy` and
   `MIRRORSYNC_PROXY` settings for that source.
-- A source-level `mode: direct` bypasses inherited `sync.download.proxy` and
-  `MIRRORSYNC_PROXY` settings for that source.
-- When source-level proxy configuration and `sync.download.proxy` are unset
-  and `MIRRORSYNC_PROXY` is set, `mirrorsync` uses the proxy from the
-  environment variable.
+- A source-level `proxy.enabled: false` bypasses inherited
+  `sync.download.proxy` and `MIRRORSYNC_PROXY` settings for that source.
+- A source-level `proxy.enabled: true` explicitly activates inherited
+  `sync.download.proxy` or `MIRRORSYNC_PROXY` settings for that source.
+- When source-level proxy configuration and `sync.download.proxy` are unset,
+  `MIRRORSYNC_PROXY` is set, and proxy inheritance is enabled by default,
+  `mirrorsync` uses the proxy from the environment variable.
 - HTTPS source URLs work through the configured proxy by using `CONNECT`.
 - Repeated requests to the same source or proxy reuse existing connections when
   the peer permits keep-alive.

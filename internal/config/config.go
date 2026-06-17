@@ -44,23 +44,28 @@ type Schedule struct {
 }
 
 type Download struct {
-	Retries                      int   `yaml:"retries"`
-	MaxConnectionsPerSource      int   `yaml:"max_connections_per_source"`
-	MaxInFlightRequests          int   `yaml:"max_in_flight_requests"`
-	MaxInFlightRequestsPerSource int   `yaml:"max_in_flight_requests_per_source"`
-	Proxy                        Proxy `yaml:"proxy"`
+	Retries                      int         `yaml:"retries"`
+	MaxConnectionsPerSource      int         `yaml:"max_connections_per_source"`
+	MaxInFlightRequests          int         `yaml:"max_in_flight_requests"`
+	MaxInFlightRequestsPerSource int         `yaml:"max_in_flight_requests_per_source"`
+	Proxy                        GlobalProxy `yaml:"proxy"`
 }
 
-type Proxy struct {
-	URL  string `yaml:"url"`
-	Mode string `yaml:"mode"`
+type GlobalProxy struct {
+	URL              string `yaml:"url"`
+	EnabledByDefault *bool  `yaml:"enabled_by_default"`
+}
+
+type SourceProxy struct {
+	URL     string `yaml:"url"`
+	Enabled *bool  `yaml:"enabled"`
 }
 
 type Source struct {
-	URL                 string `yaml:"url"`
-	MaxConnections      int    `yaml:"max_connections"`
-	MaxInFlightRequests int    `yaml:"max_in_flight_requests"`
-	Proxy               Proxy  `yaml:"proxy"`
+	URL                 string      `yaml:"url"`
+	MaxConnections      int         `yaml:"max_connections"`
+	MaxInFlightRequests int         `yaml:"max_in_flight_requests"`
+	Proxy               SourceProxy `yaml:"proxy"`
 }
 
 type APTSection struct {
@@ -285,7 +290,7 @@ func (c *Config) validate() error {
 	if c.Sync.Download.MaxInFlightRequestsPerSource < 0 {
 		return fmt.Errorf("sync.download.max_in_flight_requests_per_source must be non-negative")
 	}
-	if err := validateProxy(c.Sync.Download.Proxy); err != nil {
+	if err := validateGlobalProxy(c.Sync.Download.Proxy); err != nil {
 		return fmt.Errorf("sync.download.proxy: %w", err)
 	}
 	if c.Sync.Schedule.Interval != "" {
@@ -457,26 +462,30 @@ func validateHTTPSource(src Source) error {
 	if src.MaxInFlightRequests < 0 {
 		return errors.New("max_in_flight_requests must be non-negative")
 	}
-	return validateProxy(src.Proxy)
+	return validateSourceProxy(src.Proxy)
 }
 
-func validateProxy(p Proxy) error {
-	hasURL := p.URL != ""
-	hasDirect := p.Mode == "direct"
-	if p.Mode != "" && p.Mode != "direct" {
-		return errors.New("mode must be direct when set")
+func validateGlobalProxy(p GlobalProxy) error {
+	return validateProxyURL(p.URL)
+}
+
+func validateSourceProxy(p SourceProxy) error {
+	if p.URL != "" && p.Enabled != nil {
+		return errors.New("specify only one of url or enabled")
 	}
-	if hasURL && hasDirect {
-		return errors.New("specify exactly one of url or mode: direct")
+	return validateProxyURL(p.URL)
+}
+
+func validateProxyURL(raw string) error {
+	if raw == "" {
+		return nil
 	}
-	if hasURL {
-		u, err := url.Parse(p.URL)
-		if err != nil {
-			return err
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return errors.New("proxy url must use http or https")
-		}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("proxy url must use http or https")
 	}
 	return nil
 }
@@ -540,16 +549,23 @@ func (c *Config) PayloadSources(repoName string, kind RepoKind, primary Source, 
 	return out, nil
 }
 
-func (c *Config) resolveProxy(src Proxy) (string, bool, error) {
-	if src.Mode == "direct" {
-		return "", true, nil
-	}
+func (c *Config) resolveProxy(src SourceProxy) (string, bool, error) {
 	if src.URL != "" {
 		return src.URL, false, nil
 	}
-	if c.Sync.Download.Proxy.Mode == "direct" {
+	if src.Enabled != nil {
+		if !*src.Enabled {
+			return "", true, nil
+		}
+		return c.inheritedProxy()
+	}
+	if c.Sync.Download.Proxy.EnabledByDefault != nil && !*c.Sync.Download.Proxy.EnabledByDefault {
 		return "", true, nil
 	}
+	return c.inheritedProxy()
+}
+
+func (c *Config) inheritedProxy() (string, bool, error) {
 	if c.Sync.Download.Proxy.URL != "" {
 		return c.Sync.Download.Proxy.URL, false, nil
 	}
@@ -557,7 +573,7 @@ func (c *Config) resolveProxy(src Proxy) (string, bool, error) {
 	if env == "" {
 		return "", true, nil
 	}
-	if err := validateProxy(Proxy{URL: env}); err != nil {
+	if err := validateProxyURL(env); err != nil {
 		return "", false, fmt.Errorf("MIRRORSYNC_PROXY: %w", err)
 	}
 	return env, false, nil

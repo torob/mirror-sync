@@ -53,9 +53,9 @@ apk:
 func TestSourceProxyPrecedence(t *testing.T) {
 	t.Setenv("MIRRORSYNC_PROXY", "http://env.example:8080")
 	cfg := &Config{
-		Sync: Sync{Download: Download{Proxy: Proxy{URL: "http://global.example:8080"}, MaxConnectionsPerSource: 2}},
+		Sync: Sync{Download: Download{Proxy: GlobalProxy{URL: "http://global.example:8080"}, MaxConnectionsPerSource: 2}},
 	}
-	src, err := cfg.Source("repo", RepoAPT, SourcePrimary, 0, Source{URL: "https://example.com", Proxy: Proxy{Mode: "direct"}})
+	src, err := cfg.Source("repo", RepoAPT, SourcePrimary, 0, Source{URL: "https://example.com", Proxy: SourceProxy{Enabled: boolPtr(false)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +68,82 @@ func TestSourceProxyPrecedence(t *testing.T) {
 	}
 	if src.ProxyURL != "http://global.example:8080" {
 		t.Fatalf("got proxy %q", src.ProxyURL)
+	}
+}
+
+func TestProxyEnabledByDefault(t *testing.T) {
+	t.Setenv("MIRRORSYNC_PROXY", "http://env.example:8080")
+	cfg := &Config{Sync: Sync{Download: Download{
+		Proxy: GlobalProxy{URL: "http://global.example:8080", EnabledByDefault: boolPtr(false)},
+	}}}
+	src, err := cfg.Source("repo", RepoAPT, SourceMirror, 0, Source{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !src.DirectProxy || src.ProxyURL != "" {
+		t.Fatalf("unannotated source should be direct when proxy disabled by default: %+v", src)
+	}
+	src, err = cfg.Source("repo", RepoAPT, SourceMirror, 0, Source{URL: "https://example.com", Proxy: SourceProxy{Enabled: boolPtr(true)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.DirectProxy || src.ProxyURL != "http://global.example:8080" {
+		t.Fatalf("enabled source should inherit global proxy: %+v", src)
+	}
+}
+
+func TestProxyEnabledUsesEnvironmentFallback(t *testing.T) {
+	t.Setenv("MIRRORSYNC_PROXY", "http://env.example:8080")
+	cfg := &Config{Sync: Sync{Download: Download{
+		Proxy: GlobalProxy{EnabledByDefault: boolPtr(false)},
+	}}}
+	src, err := cfg.Source("repo", RepoAPT, SourceMirror, 0, Source{URL: "https://example.com", Proxy: SourceProxy{Enabled: boolPtr(true)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.DirectProxy || src.ProxyURL != "http://env.example:8080" {
+		t.Fatalf("enabled source should inherit environment proxy: %+v", src)
+	}
+}
+
+func TestSourceProxyURLOverridesEnablement(t *testing.T) {
+	cfg := &Config{Sync: Sync{Download: Download{
+		Proxy: GlobalProxy{URL: "http://global.example:8080", EnabledByDefault: boolPtr(false)},
+	}}}
+	src, err := cfg.Source("repo", RepoAPT, SourceMirror, 0, Source{URL: "https://example.com", Proxy: SourceProxy{URL: "http://source.example:8080"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.DirectProxy || src.ProxyURL != "http://source.example:8080" {
+		t.Fatalf("source proxy URL should win: %+v", src)
+	}
+}
+
+func TestLoadRejectsInvalidProxyFields(t *testing.T) {
+	for name, mutate := range map[string]func(string) string{
+		"source url plus enabled": func(body string) string {
+			return strings.Replace(body, "        url: https://example.com/a\n", "        url: https://example.com/a\n        proxy:\n          url: http://source.example:8080\n          enabled: true\n", 1)
+		},
+		"global mode removed": func(body string) string {
+			return strings.Replace(body, "download:\n    retries: 1\n", "download:\n    retries: 1\n    proxy:\n      mode: direct\n", 1)
+		},
+		"source mode removed": func(body string) string {
+			return strings.Replace(body, "        url: https://example.com/a\n", "        url: https://example.com/a\n        proxy:\n          mode: direct\n", 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "key.gpg"), []byte("key"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(path, []byte(mutate(validLimitsConfig())), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load succeeded, want proxy validation error")
+			}
+		})
 	}
 }
 
@@ -223,7 +299,7 @@ func TestPayloadSourcesSkipsPrimaryWithSameNormalizedMirrorURL(t *testing.T) {
 
 func TestPayloadSourcesPreservesPrimaryFallbackSettings(t *testing.T) {
 	cfg := &Config{Sync: Sync{Download: Download{
-		Proxy:                        Proxy{URL: "http://global-proxy.example:8080"},
+		Proxy:                        GlobalProxy{URL: "http://global-proxy.example:8080"},
 		MaxConnectionsPerSource:      4,
 		MaxInFlightRequests:          12,
 		MaxInFlightRequestsPerSource: 5,
@@ -231,13 +307,13 @@ func TestPayloadSourcesPreservesPrimaryFallbackSettings(t *testing.T) {
 	sources, err := cfg.PayloadSources("repo", RepoAPT,
 		Source{
 			URL:                 "https://primary.example/repo",
-			Proxy:               Proxy{URL: "http://primary-proxy.example:8080"},
+			Proxy:               SourceProxy{URL: "http://primary-proxy.example:8080"},
 			MaxConnections:      2,
 			MaxInFlightRequests: 3,
 		},
 		[]Source{{
 			URL:                 "https://mirror.example/repo",
-			Proxy:               Proxy{Mode: "direct"},
+			Proxy:               SourceProxy{Enabled: boolPtr(false)},
 			MaxConnections:      8,
 			MaxInFlightRequests: 9,
 		}},
@@ -252,6 +328,10 @@ func TestPayloadSourcesPreservesPrimaryFallbackSettings(t *testing.T) {
 	if primary.Role != SourcePrimary || primary.ProxyURL != "http://primary-proxy.example:8080" || primary.DirectProxy || primary.MaxConnections != 2 || primary.MaxInFlightRequests != 3 {
 		t.Fatalf("primary fallback settings = %+v", primary)
 	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func TestValidateRejectsNegativeMaxInFlight(t *testing.T) {

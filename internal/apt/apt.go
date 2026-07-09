@@ -41,6 +41,7 @@ type Runner struct {
 
 type releaseFile struct {
 	Size      int64
+	SizeSet   bool
 	Checksums map[string]string
 }
 
@@ -81,7 +82,7 @@ func (r *Runner) Sync(ctx context.Context) error {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if r.Config.Sync.Prune {
-		_, err := r.Prune(ctx)
+		_, err := r.pruneState(state)
 		return err
 	}
 	return nil
@@ -119,6 +120,11 @@ func (r *Runner) Prune(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	_ = ctx
+	return r.pruneState(state)
+}
+
+func (r *Runner) pruneState(state model.RepositoryState) ([]string, error) {
 	keep := map[string]bool{}
 	for _, mf := range state.Metadata {
 		keep[mf.Path] = true
@@ -129,7 +135,6 @@ func (r *Runner) Prune(ctx context.Context) ([]string, error) {
 	for rel := range state.Packages {
 		keep[rel] = true
 	}
-	_ = ctx
 	return publish.Prune(r.Repo.AbsPublishPath, keep)
 }
 
@@ -233,7 +238,15 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 		if err != nil {
 			return "", nil, nil, err
 		}
-		return string(plain), hashes, []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}}, nil
+		metadata := []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}}
+		releaseRel := path.Join("dists", suite, "Release")
+		if releaseData, err := client.GetBytes(ctx, releaseRel, 64<<20); err == nil {
+			if !bytes.Equal(releaseData, plain) {
+				return "", nil, nil, fmt.Errorf("apt %s %s differs from verified %s cleartext", r.Repo.Name, releaseRel, inReleaseRel)
+			}
+			metadata = append(metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
+		}
+		return string(plain), hashes, metadata, nil
 	}
 	releaseRel := path.Join("dists", suite, "Release")
 	sigRel := path.Join("dists", suite, "Release.gpg")
@@ -387,6 +400,13 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 				return out, err
 			}
 			out.Metadata = append(out.Metadata, model.MetadataFile{Path: inReleaseRel, Data: data, SignedLast: true})
+			releaseRel := path.Join("dists", suite.Name, "Release")
+			if releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel)); err == nil {
+				if !bytes.Equal(releaseData, plain) {
+					return out, fmt.Errorf("published %s differs from verified %s cleartext", releaseRel, inReleaseRel)
+				}
+				out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
+			}
 		} else {
 			releaseRel := path.Join("dists", suite.Name, "Release")
 			sigRel := path.Join("dists", suite.Name, "Release.gpg")
@@ -501,6 +521,9 @@ func loadKeyring(path string) (openpgp.EntityList, error) {
 }
 
 func verifyInRelease(data []byte, keyring openpgp.EntityList) ([]byte, error) {
+	if err := validateClearsignedStructure(data); err != nil {
+		return nil, err
+	}
 	block, _ := clearsign.Decode(data)
 	if block == nil {
 		return nil, fmt.Errorf("not a clearsigned document")
@@ -509,6 +532,68 @@ func verifyInRelease(data []byte, keyring openpgp.EntityList) ([]byte, error) {
 		return nil, err
 	}
 	return block.Bytes, nil
+}
+
+func validateClearsignedStructure(data []byte) error {
+	const (
+		signedBegin = "-----BEGIN PGP SIGNED MESSAGE-----"
+		sigBegin    = "-----BEGIN PGP SIGNATURE-----"
+		sigEnd      = "-----END PGP SIGNATURE-----"
+	)
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSuffix(lines[0], "\r") != signedBegin {
+		return fmt.Errorf("clearsigned document does not start with signed message block")
+	}
+	i := 1
+	for ; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\r")
+		if line == "" {
+			i++
+			break
+		}
+		if strings.HasPrefix(line, "-----BEGIN PGP ") {
+			return fmt.Errorf("clearsigned document has malformed signed message headers")
+		}
+	}
+	if i >= len(lines) {
+		return fmt.Errorf("clearsigned document missing signed message body")
+	}
+	foundSignature := false
+	for ; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\r")
+		switch line {
+		case signedBegin:
+			return fmt.Errorf("clearsigned document contains multiple signed message blocks")
+		case sigBegin:
+			foundSignature = true
+			i++
+			goto signature
+		}
+	}
+	return fmt.Errorf("clearsigned document missing signature block")
+
+signature:
+	foundEnd := false
+	for ; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\r")
+		if line == sigBegin || line == signedBegin {
+			return fmt.Errorf("clearsigned document contains multiple signature blocks")
+		}
+		if line == sigEnd {
+			foundEnd = true
+			i++
+			break
+		}
+	}
+	if !foundSignature || !foundEnd {
+		return fmt.Errorf("clearsigned document signature block was not closed")
+	}
+	for ; i < len(lines); i++ {
+		if strings.TrimSpace(strings.TrimSuffix(lines[i], "\r")) != "" {
+			return fmt.Errorf("clearsigned document contains unsigned trailing content")
+		}
+	}
+	return nil
 }
 
 func parseReleaseHashes(text string) (map[string]releaseFile, error) {
@@ -526,7 +611,7 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 			}
 			fields := strings.Fields(line)
 			if len(fields) != 3 {
-				continue
+				return nil, fmt.Errorf("invalid %s entry in Release: %q", checksumType, line)
 			}
 			size, err := strconv.ParseInt(fields[1], 10, 64)
 			if err != nil {
@@ -536,13 +621,14 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 			if existing.Checksums == nil {
 				existing.Checksums = map[string]string{}
 			}
-			if existing.Size != 0 && existing.Size != size {
+			if existing.SizeSet && existing.Size != size {
 				return nil, fmt.Errorf("%s has conflicting sizes in Release", fields[2])
 			}
 			if got := existing.Checksums[checksumType]; got != "" && !strings.EqualFold(got, fields[0]) {
 				return nil, fmt.Errorf("%s has conflicting %s hashes in Release", fields[2], checksumType)
 			}
 			existing.Size = size
+			existing.SizeSet = true
 			existing.Checksums[checksumType] = fields[0]
 			out[fields[2]] = existing
 		}
@@ -598,7 +684,7 @@ func shouldMirrorReleaseFile(rel string, components, selectedArchs, packageArchs
 	parts := strings.Split(rel, "/")
 	if len(parts) == 1 {
 		if arch, ok := contentsArch(parts[0]); ok {
-			return selectedArchs[arch]
+			return packageArchs[arch]
 		}
 		return false
 	}
@@ -622,7 +708,7 @@ func shouldMirrorReleaseFile(rel string, components, selectedArchs, packageArchs
 		return selectedArchs[arch]
 	}
 	if arch, ok := contentsArch(path.Base(rest)); ok {
-		return selectedArchs[arch]
+		return packageArchs[arch]
 	}
 	return true
 }

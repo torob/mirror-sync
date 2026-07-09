@@ -1,12 +1,25 @@
 package apt
 
 import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/download"
+	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/limit"
 	"github.com/torob/mirror-sync/internal/model"
 )
 
@@ -55,6 +68,7 @@ func TestSourceDescriptionsUsePayloadSourceOrder(t *testing.T) {
 
 func TestSelectReleaseFilesIncludesAllExceptUnselectedRealArchitectures(t *testing.T) {
 	hashes := releaseHashesFromPaths(
+		"Contents-all.gz",
 		"Contents-amd64.gz",
 		"Contents-arm64.gz",
 		"main/binary-amd64/Packages.xz",
@@ -85,6 +99,7 @@ func TestSelectReleaseFilesIncludesAllExceptUnselectedRealArchitectures(t *testi
 	}
 	got := filePaths(files)
 	want := []string{
+		"dists/resolute/Contents-all.gz",
 		"dists/resolute/Contents-amd64.gz",
 		"dists/resolute/main/binary-all/Packages.xz",
 		"dists/resolute/main/binary-all/Release",
@@ -139,6 +154,140 @@ func TestParseReleaseHashesRejectsConflictingEntries(t *testing.T) {
 `)
 	if err == nil {
 		t.Fatal("parseReleaseHashes succeeded, want conflict error")
+	}
+}
+
+func TestParseReleaseHashesRejectsMalformedEntries(t *testing.T) {
+	_, err := parseReleaseHashes(`SHA256:
+ invalid-entry
+`)
+	if err == nil {
+		t.Fatal("parseReleaseHashes succeeded, want malformed entry error")
+	}
+}
+
+func TestParseReleaseHashesRejectsZeroSizeConflict(t *testing.T) {
+	_, err := parseReleaseHashes(`SHA256:
+ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages
+SHA512:
+ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1 main/binary-amd64/Packages
+`)
+	if err == nil {
+		t.Fatal("parseReleaseHashes succeeded, want zero-size conflict error")
+	}
+}
+
+func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
+	release := []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n")
+	inRelease, keyring, plain := signedInRelease(t, release)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/stable/Release":
+			_, _ = w.Write(plain)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, client := testAPTRunnerAndClient(t, server.URL)
+	releaseText, hashes, metadata, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releaseText != string(plain) {
+		t.Fatalf("release text = %q, want verified cleartext %q", releaseText, plain)
+	}
+	if hashes["main/binary-amd64/Packages"].Size != 0 {
+		t.Fatalf("parsed size = %d, want 0", hashes["main/binary-amd64/Packages"].Size)
+	}
+	got := metadataPaths(metadata)
+	want := []string{"dists/stable/InRelease", "dists/stable/Release"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata paths = %#v, want %#v", got, want)
+	}
+}
+
+func TestFetchReleaseRejectsInconsistentPlainRelease(t *testing.T) {
+	inRelease, keyring, _ := signedInRelease(t, []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/stable/Release":
+			_, _ = w.Write([]byte("Origin: different\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, client := testAPTRunnerAndClient(t, server.URL)
+	_, _, _, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
+	if err == nil || !strings.Contains(err.Error(), "differs from verified") {
+		t.Fatalf("fetchRelease error = %v, want inconsistent Release error", err)
+	}
+}
+
+func TestFetchReleaseRejectsMalformedInReleaseWithoutFallback(t *testing.T) {
+	releaseHits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write([]byte("unsigned prefix\n-----BEGIN PGP SIGNED MESSAGE-----\n"))
+		case "/dists/stable/Release":
+			releaseHits++
+			_, _ = w.Write([]byte("Origin: fallback\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner, client := testAPTRunnerAndClient(t, server.URL)
+	_, _, _, err := runner.fetchRelease(context.Background(), client, nil, "stable")
+	if err == nil || !strings.Contains(err.Error(), "does not start") {
+		t.Fatalf("fetchRelease error = %v, want malformed InRelease error", err)
+	}
+	if releaseHits != 0 {
+		t.Fatalf("Release fallback hits = %d, want 0", releaseHits)
+	}
+}
+
+func TestValidateClearsignedStructureRejectsTrailingContent(t *testing.T) {
+	inRelease, _, _ := signedInRelease(t, []byte("Origin: example\n"))
+	err := validateClearsignedStructure(append(inRelease, []byte("\nunsigned trailer\n")...))
+	if err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("validateClearsignedStructure error = %v, want trailing content error", err)
+	}
+}
+
+func TestPruneStateRemovesStaleAlternateMetadata(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"dists/stable/InRelease", "dists/stable/Release"} {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &Runner{Repo: config.APTRepository{AbsPublishPath: root}}
+	removed, err := runner.pruneState(model.RepositoryState{
+		Packages: map[string]model.Package{},
+		Metadata: []model.MetadataFile{{Path: "dists/stable/Release"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed, []string{"dists/stable/InRelease"}) {
+		t.Fatalf("removed = %#v, want stale InRelease only", removed)
+	}
+	if _, err := os.Stat(filepath.Join(root, "dists", "stable", "Release")); err != nil {
+		t.Fatalf("Release was not kept: %v", err)
 	}
 }
 
@@ -269,4 +418,52 @@ func sourceDescriptions(sources []download.Source) []string {
 		out = append(out, source.RelPath+":"+source.Decompress)
 	}
 	return out
+}
+
+func metadataPaths(files []model.MetadataFile) []string {
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		out = append(out, file.Path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func signedInRelease(t *testing.T, release []byte) ([]byte, openpgp.EntityList, []byte) {
+	t.Helper()
+	entity, err := openpgp.NewEntity("Mirror Sync", "Test Key", "mirror-sync@example.com", &packet.Config{RSABits: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	w, err := clearsign.Encode(&out, entity.PrivateKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(release); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := verifyInRelease(out.Bytes(), openpgp.EntityList{entity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes(), openpgp.EntityList{entity}, plain
+}
+
+func testAPTRunnerAndClient(t *testing.T, url string) (*Runner, *httpx.Client) {
+	t.Helper()
+	cfg := &config.Config{Sync: config.Sync{Download: config.Download{MaxInFlightRequests: 4}}}
+	src, err := cfg.Source("repo", config.RepoAPT, config.SourcePrimary, 0, config.Source{URL: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests()))
+	client, err := factory.Client(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Runner{Config: cfg, Repo: config.APTRepository{Name: "repo"}, HTTP: factory}, client
 }

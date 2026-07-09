@@ -16,7 +16,7 @@ func TestLoadRejectsDuplicateResolvedPublishPaths(t *testing.T) {
 	cfg := []byte(`
 version: 1
 storage:
-  root: repos
+  published: repos
   staging: staged
 apt:
   repositories:
@@ -47,6 +47,27 @@ apk:
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatalf("Load succeeded, want duplicate publish_path error")
+	}
+}
+
+func TestLoadRejectsStorageRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := []byte(`
+version: 1
+storage:
+  root: repos
+  staging: staged
+`)
+	if err := os.WriteFile(path, cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("Load succeeded, want unknown storage.root error")
+	}
+	if !strings.Contains(err.Error(), "field root not found") {
+		t.Fatalf("Load error = %v, want unknown root field", err)
 	}
 }
 
@@ -161,7 +182,7 @@ func TestLoadRejectsRemovedFields(t *testing.T) {
 			body := `
 version: 1
 storage:
-  root: repos
+  published: repos
   staging: staged
 sync:
 ` + extra
@@ -349,7 +370,7 @@ func TestValidateRejectsNegativeMaxInFlight(t *testing.T) {
 			cfg := &Config{
 				Version:   1,
 				ConfigDir: dir,
-				Storage:   Storage{Root: "repos", Staging: "staged"},
+				Storage:   Storage{Published: "repos", Staging: "staged"},
 				APT: APTSection{Repositories: []APTRepository{{
 					Name: "a", PublishPath: "a", Keyring: "key.gpg",
 					PrimarySource: Source{URL: "https://example.com/a"},
@@ -441,7 +462,7 @@ func validLimitsConfig() string {
 	return `
 version: 1
 storage:
-  root: repos
+  published: repos
   staging: staged
 sync:
   download:

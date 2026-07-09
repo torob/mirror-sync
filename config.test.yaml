@@ -1,7 +1,7 @@
 version: 1
 
 storage:
-  root: .e2e/repos
+  published: .e2e/repos
   staging: .e2e/staged
 
 sync:

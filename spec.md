@@ -138,7 +138,7 @@ Configuration is YAML with a required `version` field and optional top-level
 version: 1
 
 storage:
-  root: /srv/mirrors
+  published: /srv/mirrors
   staging: /srv/mirrors/.staging
 
 sync:
@@ -202,17 +202,17 @@ apk:
 ### Configuration Rules
 
 - `version` must be `1`.
-- `storage.root` is the served mirror root.
+- `storage.published` is the served mirror root.
 - `storage.staging` is used for temporary downloads and must not be inside a
   client-visible repository path unless it is hidden from clients.
 - `storage.staging` is the default location for internal sync state such as
   per-repository lock files.
-- `storage.staging` and `storage.root` must be on the same filesystem so
+- `storage.staging` and `storage.published` must be on the same filesystem so
   verified package payloads can be moved into the published tree with atomic,
   metadata-only rename operations.
-- `publish_path` is relative to `storage.root`.
-- `publish_path` must not be absolute and must not escape `storage.root`.
-- Each configured `publish_path` is resolved against `storage.root`, cleaned,
+- `publish_path` is relative to `storage.published`.
+- `publish_path` must not be absolute and must not escape `storage.published`.
+- Each configured `publish_path` is resolved against `storage.published`, cleaned,
   and converted to an absolute path during configuration validation.
 - Resolved publish paths must be unique across all APT and APK repositories.
   Configuration with duplicate resolved publish paths is invalid.
@@ -797,7 +797,7 @@ For APK repositories, verification must confirm:
 - An APT repository can verify upstream metadata with a relative keyring path
   resolved from the configuration file directory.
 - Configuration validation rejects duplicate publish paths after resolving
-  them to absolute paths under `storage.root`.
+  them to absolute paths under `storage.published`.
 - A stale or incomplete local mirror source does not corrupt the published
   mirror; valid payloads are fetched from later sources.
 - When an HTTPS proxy URL is configured, traffic between `mirrorsync` and the

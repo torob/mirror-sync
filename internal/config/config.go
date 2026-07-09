@@ -27,8 +27,8 @@ type Config struct {
 }
 
 type Storage struct {
-	Root    string `yaml:"root"`
-	Staging string `yaml:"staging"`
+	Published string `yaml:"published"`
+	Staging   string `yaml:"staging"`
 }
 
 type Sync struct {
@@ -270,9 +270,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("version must be 1")
 	}
 	var err error
-	c.Storage.Root, err = resolvePath(c.ConfigDir, c.Storage.Root)
+	c.Storage.Published, err = resolvePath(c.ConfigDir, c.Storage.Published)
 	if err != nil {
-		return fmt.Errorf("storage.root: %w", err)
+		return fmt.Errorf("storage.published: %w", err)
 	}
 	c.Storage.Staging, err = resolvePath(c.ConfigDir, c.Storage.Staging)
 	if err != nil {
@@ -329,7 +329,7 @@ func (c *Config) validate() error {
 				return fmt.Errorf("apt repository %s mirror_sources[%d]: %w", repo.Name, j, err)
 			}
 		}
-		repo.AbsPublishPath, err = resolvePublish(c.Storage.Root, repo.PublishPath)
+		repo.AbsPublishPath, err = resolvePublish(c.Storage.Published, repo.PublishPath)
 		if err != nil {
 			return fmt.Errorf("apt repository %s publish_path: %w", repo.Name, err)
 		}
@@ -373,7 +373,7 @@ func (c *Config) validate() error {
 				return fmt.Errorf("apk repository %s mirror_sources[%d]: %w", repo.Name, j, err)
 			}
 		}
-		repo.AbsPublishPath, err = resolvePublish(c.Storage.Root, repo.PublishPath)
+		repo.AbsPublishPath, err = resolvePublish(c.Storage.Published, repo.PublishPath)
 		if err != nil {
 			return fmt.Errorf("apk repository %s publish_path: %w", repo.Name, err)
 		}
@@ -414,7 +414,7 @@ func resolvePublish(root, p string) (string, error) {
 	}
 	clean := filepath.Clean(p)
 	if clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || clean == ".." {
-		return "", errors.New("publish_path must not escape storage.root")
+		return "", errors.New("publish_path must not escape storage.published")
 	}
 	abs, err := filepath.Abs(filepath.Join(root, clean))
 	if err != nil {
@@ -425,7 +425,7 @@ func resolvePublish(root, p string) (string, error) {
 		return "", err
 	}
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("publish_path must not escape storage.root")
+		return "", errors.New("publish_path must not escape storage.published")
 	}
 	return abs, nil
 }

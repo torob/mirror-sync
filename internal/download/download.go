@@ -103,7 +103,7 @@ func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clien
 		return err
 	}
 	os.Remove(staged)
-	return downloadAndPublish(ctx, clients, expected, staged, final)
+	return downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
 }
 
 func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
@@ -131,13 +131,13 @@ func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, cli
 	); err != nil {
 		return err
 	} else if ok {
-		return publishStaged(staged, final)
+		return publish.PublishFile(publishRoot, staged, final)
 	}
 	os.Remove(staged)
-	return downloadAndPublish(ctx, clients, expected, staged, final)
+	return downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
 }
 
-func downloadAndPublish(ctx context.Context, clients []*httpx.Client, expected Expected, staged, final string) error {
+func downloadAndPublish(ctx context.Context, publishRoot string, clients []*httpx.Client, expected Expected, staged, final string) error {
 	var failures []string
 	for _, client := range clients {
 		if err := downloadOne(ctx, client, expected, staged); err != nil {
@@ -151,7 +151,7 @@ func downloadAndPublish(ctx context.Context, clients []*httpx.Client, expected E
 				continue
 			}
 		}
-		return publishStaged(staged, final)
+		return publish.PublishFile(publishRoot, staged, final)
 	}
 	return fmt.Errorf("all sources failed for %s: %s", expected.RelPath, strings.Join(failures, "; "))
 }
@@ -199,16 +199,6 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 	}
 	if err := os.Rename(tmp, staged); err != nil {
 		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-func publishStaged(staged, final string) error {
-	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(staged, final); err != nil {
 		return err
 	}
 	return nil

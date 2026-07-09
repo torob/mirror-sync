@@ -503,6 +503,11 @@ Requirements:
 - Moving a verified package payload from staging to the published tree must use
   an atomic rename on the same filesystem. Cross-filesystem copy-and-delete
   moves must not be used for publishing verified payloads.
+- Repository files newly written or moved into the published tree, including
+  metadata and package payloads, must have mode `0644`. Published repository
+  directories created or touched during publishing must have mode `0755`.
+  These modes are exact and must not depend on the process umask. Existing
+  payloads reused during sync are not mode-repaired by normal sync.
 - Metadata files and package indexes may be buffered in memory when their
   expected size is small enough for normal repository metadata processing, but
   package payload memory usage must remain bounded by buffer size and

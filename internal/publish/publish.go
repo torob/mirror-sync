@@ -20,6 +20,11 @@ type Lock struct {
 	file *os.File
 }
 
+const (
+	PublishedFileMode os.FileMode = 0o644
+	PublishedDirMode  os.FileMode = 0o755
+)
+
 func AcquireLock(stagingRoot, kind, name string) (*Lock, error) {
 	lockName := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(kind + "-" + name + ".lock")
 	lockPath := filepath.Join(stagingRoot, "locks", lockName)
@@ -165,7 +170,10 @@ func AtomicWrite(root, stagingRoot, rel string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+	if err := os.Chmod(tmpName, PublishedFileMode); err != nil {
+		return err
+	}
+	if err := ensurePublishedDirs(root, filepath.Dir(final)); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, final); err != nil {
@@ -186,6 +194,54 @@ func PublishMetadata(root, stagingRoot string, files []model.MetadataFile) error
 	for _, f := range files {
 		if err := AtomicWrite(root, stagingRoot, f.Path, f.Data); err != nil {
 			return fmt.Errorf("publish metadata %s: %w", f.Path, err)
+		}
+	}
+	return nil
+}
+
+func PublishFile(root, staged, final string) error {
+	if err := ensurePublishedDirs(root, filepath.Dir(final)); err != nil {
+		return err
+	}
+	if err := os.Chmod(staged, PublishedFileMode); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, final); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(final))
+}
+
+func ensurePublishedDirs(root, dir string) error {
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return err
+	}
+	dirAbs, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootAbs, dirAbs)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("published directory %s escapes root %s", dirAbs, rootAbs)
+	}
+	if err := os.MkdirAll(dirAbs, PublishedDirMode); err != nil {
+		return err
+	}
+	cur := rootAbs
+	if err := os.Chmod(cur, PublishedDirMode); err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	for _, elem := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, elem)
+		if err := os.Chmod(cur, PublishedDirMode); err != nil {
+			return err
 		}
 	}
 	return nil

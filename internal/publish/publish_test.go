@@ -9,6 +9,8 @@ import (
 	"sort"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/torob/mirror-sync/internal/model"
 )
 
@@ -39,6 +41,24 @@ func TestMetadataPriorityPublishesIndexesBeforeReleaseBeforeSignatures(t *testin
 			t.Fatalf("files[%d] = %s, want %s", i, files[i].Path, want[i])
 		}
 	}
+}
+
+func TestAtomicWritePublishesReadableFileAndDirectoriesWithRestrictiveUmask(t *testing.T) {
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
+
+	root := t.TempDir()
+	staging := t.TempDir()
+	rel := "dists/noble/main/binary-amd64/Packages"
+	if err := AtomicWrite(root, staging, rel, []byte("metadata")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertMode(t, filepath.Join(root, rel), PublishedFileMode)
+	assertMode(t, root, PublishedDirMode)
+	assertMode(t, filepath.Join(root, "dists"), PublishedDirMode)
+	assertMode(t, filepath.Join(root, "dists", "noble"), PublishedDirMode)
+	assertMode(t, filepath.Join(root, "dists", "noble", "main", "binary-amd64"), PublishedDirMode)
 }
 
 func TestVerifyOptions(t *testing.T) {
@@ -142,5 +162,16 @@ func TestVerifyOptions(t *testing.T) {
 				t.Fatalf("Verify() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/httpx"
 	"github.com/torob/mirror-sync/internal/limit"
@@ -148,6 +150,61 @@ func TestEnsureManyFallsBackSourcesInOrder(t *testing.T) {
 	if string(got) != "package-a" {
 		t.Fatalf("published payload = %q", got)
 	}
+}
+
+func TestEnsureSyncedPublishesReadablePayloadAndDirectoriesWithRestrictiveUmask(t *testing.T) {
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
+
+	data := map[string][]byte{"pool/main/a.deb": []byte("package-a")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := data[r.URL.Path[1:]]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	assertMode(t, filepath.Join(root, "pool", "main", "a.deb"), 0o644)
+	assertMode(t, root, 0o755)
+	assertMode(t, filepath.Join(root, "pool"), 0o755)
+	assertMode(t, filepath.Join(root, "pool", "main"), 0o755)
+}
+
+func TestEnsureSyncedReusesExistingPayloadWithoutRepairingMode(t *testing.T) {
+	good := []byte("package-a")
+	root := t.TempDir()
+	pool := filepath.Join(root, "pool")
+	if err := os.MkdirAll(pool, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	final := filepath.Join(pool, "a.deb")
+	if err := os.WriteFile(final, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write(good)
+	}))
+	defer server.Close()
+
+	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
+		t.Fatal(err)
+	}
+	if hits != 0 {
+		t.Fatalf("downloads = %d, want 0", hits)
+	}
+	assertMode(t, final, 0o600)
+	assertMode(t, pool, 0o700)
 }
 
 func TestEnsureSizeOnlyReusesMatchingSizePayloadWithoutVerification(t *testing.T) {
@@ -382,4 +439,15 @@ func testExpected(data map[string][]byte) []Expected {
 		out = append(out, Expected{RelPath: rel, Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])})
 	}
 	return out
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
+	}
 }

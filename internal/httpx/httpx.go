@@ -31,6 +31,10 @@ type Client struct {
 	retries       int
 }
 
+var retryBackoff = func(attempt int) time.Duration {
+	return time.Duration(attempt) * time.Second
+}
+
 func NewFactory(retries int, globalLimiter *limit.Limiter) *Factory {
 	return &Factory{clients: map[string]*Client{}, retries: retries, globalLimiter: globalLimiter}
 }
@@ -148,7 +152,7 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(attempt+1) * time.Second):
+			case <-time.After(retryBackoff(attempt + 1)):
 			}
 		}
 	}

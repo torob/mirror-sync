@@ -2,12 +2,12 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/torob/mirror-sync/internal/apk"
 	"github.com/torob/mirror-sync/internal/apt"
@@ -19,8 +19,10 @@ import (
 )
 
 type App struct {
-	Config *config.Config
-	HTTP   *httpx.Factory
+	Config               *config.Config
+	HTTP                 *httpx.Factory
+	repoRunnersOverride  func() []repoTask
+	repositoryRetryDelay func(int) time.Duration
 }
 
 func New(cfg *config.Config) *App {
@@ -42,19 +44,19 @@ func (a *App) Plan(ctx context.Context) error {
 }
 
 func (a *App) Sync(ctx context.Context) error {
-	return a.eachRepo(ctx, func(ctx context.Context, runner repoRunner) error {
+	return a.eachRepo(ctx, a.Config.Sync.RepositoryRetries, func(ctx context.Context, runner repoRunner) error {
 		return runner.Sync(ctx)
 	})
 }
 
 func (a *App) Verify(ctx context.Context) error {
-	return a.eachRepo(ctx, func(ctx context.Context, runner repoRunner) error {
+	return a.eachRepo(ctx, 0, func(ctx context.Context, runner repoRunner) error {
 		return runner.Verify(ctx)
 	})
 }
 
 func (a *App) Prune(ctx context.Context) error {
-	return a.eachRepo(ctx, func(ctx context.Context, runner repoRunner) error {
+	return a.eachRepo(ctx, 0, func(ctx context.Context, runner repoRunner) error {
 		removed, err := runner.Prune(ctx)
 		for _, rel := range removed {
 			fmt.Printf("pruned %s\n", rel)
@@ -103,6 +105,11 @@ type planRunner interface {
 	Plan(context.Context) (model.RepositoryPlan, error)
 }
 
+type repoTask struct {
+	label  string
+	runner repoRunner
+}
+
 func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) {
 	var plans []model.RepositoryPlan
 	for _, runner := range a.planRunners() {
@@ -115,25 +122,72 @@ func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) 
 	return plans, nil
 }
 
-func (a *App) eachRepo(ctx context.Context, fn func(context.Context, repoRunner) error) error {
+func (a *App) eachRepo(ctx context.Context, retries int, fn func(context.Context, repoRunner) error) error {
 	runners := a.repoRunners()
-	g, ctx := errgroup.WithContext(ctx)
-	for _, runner := range runners {
-		runner := runner
-		g.Go(func() error {
-			return fn(ctx, runner)
-		})
+	errs := make([]error, len(runners))
+	var wg sync.WaitGroup
+	for i, task := range runners {
+		i, task := i, task
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = a.runRepoWithRetries(ctx, task, retries, fn)
+		}()
 	}
-	return g.Wait()
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
-func (a *App) repoRunners() []repoRunner {
-	var out []repoRunner
+func (a *App) runRepoWithRetries(ctx context.Context, task repoTask, retries int, fn func(context.Context, repoRunner) error) error {
+	label := task.label
+	if label == "" {
+		label = "repository"
+	}
+	for attempt := 0; attempt <= retries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		err := fn(ctx, task.runner)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || attempt == retries {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		timer := time.NewTimer(a.repoRetryDelay(attempt + 1))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%s: %w", label, errors.Join(err, ctx.Err()))
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func (a *App) repoRetryDelay(retry int) time.Duration {
+	if a.repositoryRetryDelay != nil {
+		return a.repositoryRetryDelay(retry)
+	}
+	return time.Duration(retry) * time.Second
+}
+
+func (a *App) repoRunners() []repoTask {
+	if a.repoRunnersOverride != nil {
+		return a.repoRunnersOverride()
+	}
+	var out []repoTask
 	for _, repo := range a.Config.APT.Repositories {
-		out = append(out, &apt.Runner{Config: a.Config, Repo: repo, HTTP: a.HTTP})
+		out = append(out, repoTask{
+			label:  "apt/" + repo.Name,
+			runner: &apt.Runner{Config: a.Config, Repo: repo, HTTP: a.HTTP},
+		})
 	}
 	for _, repo := range a.Config.APK.Repositories {
-		out = append(out, &apk.Runner{Config: a.Config, Repo: repo, HTTP: a.HTTP})
+		out = append(out, repoTask{
+			label:  "apk/" + repo.Name,
+			runner: &apk.Runner{Config: a.Config, Repo: repo, HTTP: a.HTTP},
+		})
 	}
 	return out
 }

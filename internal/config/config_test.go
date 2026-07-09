@@ -92,6 +92,62 @@ func TestSourceProxyPrecedence(t *testing.T) {
 	}
 }
 
+func TestLoadRepositoryRetries(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "key.gpg"), []byte("key"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(validLimitsConfig(), "sync:\n  download:", "sync:\n  repository_retries: 2\n  download:", 1)
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sync.RepositoryRetries != 2 {
+		t.Fatalf("repository retries = %d, want 2", cfg.Sync.RepositoryRetries)
+	}
+}
+
+func TestLoadRejectsNegativeRepositoryRetries(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "key.gpg"), []byte("key"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(validLimitsConfig(), "sync:\n  download:", "sync:\n  repository_retries: -1\n  download:", 1)
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want negative repository retries error")
+	}
+	if !strings.Contains(err.Error(), "sync.repository_retries must be non-negative") {
+		t.Fatalf("Load error = %v, want repository retries validation", err)
+	}
+}
+
+func TestLoadDefaultsRepositoryRetriesToZero(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "key.gpg"), []byte("key"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(validLimitsConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sync.RepositoryRetries != 0 {
+		t.Fatalf("repository retries default = %d, want 0", cfg.Sync.RepositoryRetries)
+	}
+}
+
 func TestProxyEnabledByDefault(t *testing.T) {
 	t.Setenv("MIRRORSYNC_PROXY", "http://env.example:8080")
 	cfg := &Config{Sync: Sync{Download: Download{

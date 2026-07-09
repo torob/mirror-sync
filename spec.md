@@ -143,6 +143,7 @@ storage:
 
 sync:
   prune: true
+  repository_retries: 2
   schedule:
     cron: "0 3 * * *"
     timezone: Asia/Tehran
@@ -259,6 +260,9 @@ apk:
   `Europe/Berlin`.
 - The `sync` command runs exactly one sync cycle and does not repeat when
   `sync.schedule` is configured.
+- `sync.repository_retries`, when set, must be a non-negative integer. It
+  configures additional whole-repository sync attempts after a repository
+  fails, so `2` permits up to three total attempts for that repository.
 - `sync.download` configures outbound source downloads for one-shot and
   scheduled sync cycles.
 - `sync.download.retries`, when set, must be a non-negative integer.
@@ -640,6 +644,21 @@ Requirements:
 - Different configured repositories may download, verify, stage, and publish
   concurrently when in-flight request limits and source connection limits
   permit it.
+- Each configured repository run is isolated from other repository runs in the
+  same cycle. Repository-local failures, retries, locks, staging state, and
+  publish decisions must not alter the execution state of another configured
+  repository.
+- A failed repository does not cancel other repositories in the same sync,
+  verify, or prune cycle. The command waits for every configured repository to
+  finish and reports all failed repositories.
+- Whole-repository retries apply only to sync cycles. Verify and prune cycles
+  report failed repositories without retrying them.
+- A successful repository in a sync cycle is not rerun because another
+  repository failed.
+- Whole-repository retry backoff is linear: wait one second before the first
+  retry, two seconds before the second retry, and so on. Parent context
+  cancellation, such as interrupt or SIGTERM, cancels all in-progress
+  repositories and prevents further repository retries.
 - A single configured repository may download, verify, stage, and publish
   multiple package payloads concurrently when in-flight request limits and
   source connection limits permit it.

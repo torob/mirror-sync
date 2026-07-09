@@ -32,9 +32,10 @@ type Storage struct {
 }
 
 type Sync struct {
-	Prune    bool     `yaml:"prune"`
-	Schedule Schedule `yaml:"schedule"`
-	Download Download `yaml:"download"`
+	Prune             bool     `yaml:"prune"`
+	RepositoryRetries int      `yaml:"repository_retries"`
+	Schedule          Schedule `yaml:"schedule"`
+	Download          Download `yaml:"download"`
 }
 
 type Schedule struct {
@@ -280,6 +281,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sync.Download.Retries < 0 {
 		return fmt.Errorf("sync.download.retries must be non-negative")
+	}
+	if c.Sync.RepositoryRetries < 0 {
+		return fmt.Errorf("sync.repository_retries must be non-negative")
 	}
 	if c.Sync.Download.MaxConnectionsPerSource < 0 {
 		return fmt.Errorf("sync.download.max_connections_per_source must be non-negative")

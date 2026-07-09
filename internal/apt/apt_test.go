@@ -126,6 +126,116 @@ func TestPackageIndexArchitecturesAddsImplicitAll(t *testing.T) {
 	}
 }
 
+func TestFetchStateSkipsReleaseAbsentConfiguredArchitecture(t *testing.T) {
+	release := []byte("Origin: example\nSHA256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	keyringPath := writeTestKeyring(t, keyring)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/stable/main/binary-amd64/Packages":
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := testFetchStateRunner(t, server.URL, keyringPath, t.TempDir(), []string{"amd64", "arm64"})
+	state, err := runner.fetchState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Packages) != 0 {
+		t.Fatalf("packages = %d, want none", len(state.Packages))
+	}
+}
+
+func TestFetchStateAllowsReleaseAbsentPublishedBranchToBePruned(t *testing.T) {
+	release := []byte("Origin: example\nSHA256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	keyringPath := writeTestKeyring(t, keyring)
+	publishRoot := t.TempDir()
+	writeTestFile(t, publishRoot, "dists/stable/main/binary-arm64/Packages.xz", []byte("stale"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/stable/main/binary-amd64/Packages":
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runner := testFetchStateRunner(t, server.URL, keyringPath, publishRoot, []string{"amd64", "arm64"})
+	state, err := runner.fetchState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range state.Files {
+		if file.Path == "dists/stable/main/binary-arm64/Packages.xz" {
+			t.Fatalf("state keeps stale absent branch file: %#v", state.Files)
+		}
+	}
+	removed, err := runner.pruneState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed, []string{"dists/stable/main/binary-arm64/Packages.xz"}) {
+		t.Fatalf("removed = %#v, want stale branch pruned", removed)
+	}
+}
+
+func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) {
+	root := t.TempDir()
+	release := []byte("Origin: example\nSHA256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	writePublishedInRelease(t, root, "stable", inRelease)
+	writeTestFile(t, root, "dists/stable/main/binary-amd64/Packages", nil)
+	runner := &Runner{Repo: config.APTRepository{
+		Name:           "repo",
+		AbsPublishPath: root,
+		AbsKeyring:     writeTestKeyring(t, keyring),
+		Architectures:  []string{"amd64", "arm64"},
+		Suites:         []config.APTSuite{{Name: "stable", Components: []string{"main"}}},
+	}}
+
+	state, err := runner.readPublishedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Packages) != 0 {
+		t.Fatalf("packages = %d, want none", len(state.Packages))
+	}
+}
+
+func TestReadPublishedStateRejectsAdvertisedMissingIndex(t *testing.T) {
+	root := t.TempDir()
+	release := []byte("Origin: example\nSHA256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	writePublishedInRelease(t, root, "stable", inRelease)
+	runner := &Runner{Repo: config.APTRepository{
+		Name:           "repo",
+		AbsPublishPath: root,
+		AbsKeyring:     writeTestKeyring(t, keyring),
+		Architectures:  []string{"amd64"},
+		Suites:         []config.APTSuite{{Name: "stable", Components: []string{"main"}}},
+	}}
+	hashes, err := runner.readPublishedReleaseHashes("stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !releaseAdvertisesIndex("main/binary-amd64", "Packages", hashes) {
+		t.Fatalf("Release hashes = %#v, want advertised Packages index", hashes)
+	}
+
+	_, err = runner.readPublishedState()
+	if err == nil || !strings.Contains(err.Error(), "no valid published Packages index") {
+		t.Fatalf("readPublishedState error = %v, want missing advertised index error", err)
+	}
+}
+
 func TestParseReleaseHashesKeepsAllSupportedChecksums(t *testing.T) {
 	hashes, err := parseReleaseHashes(`Origin: example
 MD5Sum:
@@ -451,6 +561,58 @@ func signedInRelease(t *testing.T, release []byte) ([]byte, openpgp.EntityList, 
 		t.Fatal(err)
 	}
 	return out.Bytes(), openpgp.EntityList{entity}, plain
+}
+
+func writePublishedInRelease(t *testing.T, root, suite string, inRelease []byte) {
+	t.Helper()
+	writeTestFile(t, root, pathJoin("dists", suite, "InRelease"), inRelease)
+}
+
+func writeTestKeyring(t *testing.T, keyring openpgp.EntityList) string {
+	t.Helper()
+	var out bytes.Buffer
+	if err := keyring[0].Serialize(&out); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "keyring.gpg")
+	if err := os.WriteFile(p, out.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func writeTestFile(t *testing.T, root, rel string, data []byte) {
+	t.Helper()
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testFetchStateRunner(t *testing.T, url, keyringPath, publishRoot string, archs []string) *Runner {
+	t.Helper()
+	cfg := &config.Config{Sync: config.Sync{Download: config.Download{MaxInFlightRequests: 4}}}
+	factory := httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests()))
+	return &Runner{
+		Config: cfg,
+		Repo: config.APTRepository{
+			Name:           "repo",
+			AbsPublishPath: publishRoot,
+			AbsKeyring:     keyringPath,
+			PrimarySource:  config.Source{URL: url},
+			Architectures:  archs,
+			Suites:         []config.APTSuite{{Name: "stable", Components: []string{"main"}}},
+		},
+		HTTP: factory,
+	}
+}
+
+func pathJoin(elem ...string) string {
+	return strings.Join(elem, "/")
 }
 
 func testAPTRunnerAndClient(t *testing.T, url string) (*Runner, *httpx.Client) {

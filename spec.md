@@ -600,6 +600,9 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 - Parse the verified `Release` metadata.
 - Download referenced `Packages.*`, Debian Installer `Packages.*`, and
   `Sources.*` indexes from `primary_source`.
+- If a configured suite, component, or architecture combination has no matching
+  index entry in the verified `Release` file, treat that combination as absent
+  and skip it.
 - Verify each index against hashes from the verified `Release` file, preferring
   the strongest supported checksum present.
 - Parse binary package entries for `Architecture`, `Filename`, `Size`, and a

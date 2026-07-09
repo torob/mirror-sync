@@ -171,10 +171,7 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 					return out, err
 				}
 				if !found {
-					if arch == "all" {
-						continue
-					}
-					return out, fmt.Errorf("apt %s no Packages index for %s/%s/%s", r.Repo.Name, suite.Name, component, arch)
+					continue
 				}
 				indexPlain, err := decompressIndex(indexRel, indexData)
 				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
@@ -324,10 +321,10 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 					return out, err
 				}
 				if !found {
-					if arch == "all" {
+					if !releaseAdvertisesIndex(path.Join(component, "binary-"+arch), "Packages", hashes) {
 						continue
 					}
-					return out, fmt.Errorf("no published Packages index for %s/%s/%s", suite.Name, component, arch)
+					return out, fmt.Errorf("no valid published Packages index for %s/%s/%s", suite.Name, component, arch)
 				}
 				indexPlain, err := decompressIndex(indexRel, data)
 				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
@@ -346,6 +343,9 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 					return out, err
 				}
 				if !found {
+					if releaseAdvertisesIndex(path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes) {
+						return out, fmt.Errorf("no valid published Debian Installer Packages index for %s/%s/%s", suite.Name, component, arch)
+					}
 					continue
 				}
 				indexPlain, err := decompressIndex(indexRel, data)
@@ -373,6 +373,8 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 						return out, err
 					}
 				}
+			} else if releaseAdvertisesIndex(path.Join(component, "source"), "Sources", hashes) {
+				return out, fmt.Errorf("no valid published Sources index for %s/%s", suite.Name, component)
 			}
 		}
 	}
@@ -500,6 +502,15 @@ func (r *Runner) readPublishedNamedIndex(suite, dir, name string, hashes map[str
 	return "", nil, false, nil
 }
 
+func releaseAdvertisesIndex(dir, name string, hashes map[string]releaseFile) bool {
+	for _, rel := range indexCandidates(dir, name) {
+		if _, ok := hashes[rel]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func indexCandidates(dir, name string) []string {
 	return []string{
 		path.Join(dir, name+".xz"),
@@ -600,6 +611,7 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 	out := map[string]releaseFile{}
 	var checksumType string
 	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		if name, ok := checksumHeader(line); ok {
 			checksumType = name
 			continue

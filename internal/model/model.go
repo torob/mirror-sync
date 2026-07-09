@@ -13,6 +13,12 @@ type MetadataFile struct {
 	SignedLast bool
 }
 
+type RepositoryFile struct {
+	Path   string
+	Size   int64
+	SHA256 string
+}
+
 type RepositoryPlan struct {
 	Name          string
 	Kind          string
@@ -26,5 +32,6 @@ type RepositoryPlan struct {
 
 type RepositoryState struct {
 	Metadata []MetadataFile
+	Files    []RepositoryFile
 	Packages map[string]Package
 }

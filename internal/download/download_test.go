@@ -1,6 +1,8 @@
 package download
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -149,6 +151,54 @@ func TestEnsureManyFallsBackSourcesInOrder(t *testing.T) {
 	}
 	if string(got) != "package-a" {
 		t.Fatalf("published payload = %q", got)
+	}
+}
+
+func TestEnsureManyCanMaterializeExpectedFileFromGzipSource(t *testing.T) {
+	raw := []byte("release-listed raw metadata")
+	var compressed bytes.Buffer
+	zw := gzip.NewWriter(&compressed)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hits := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[r.URL.Path]++
+		if r.URL.Path != "/dists/suite/main/dep11/icons-48x48.tar.gz" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(compressed.Bytes())
+	}))
+	defer server.Close()
+
+	sum := sha256.Sum256(raw)
+	exp := Expected{
+		RelPath:      "dists/suite/main/dep11/icons-48x48.tar",
+		Size:         int64(len(raw)),
+		SHA256:       hex.EncodeToString(sum[:]),
+		VerifyOnSync: true,
+		Sources: []Source{
+			{RelPath: "dists/suite/main/dep11/icons-48x48.tar"},
+			{RelPath: "dists/suite/main/dep11/icons-48x48.tar.gz", Decompress: "gzip"},
+		},
+	}
+	root := t.TempDir()
+	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "dists", "suite", "main", "dep11", "icons-48x48.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("materialized file = %q, want %q", got, raw)
+	}
+	if hits["/dists/suite/main/dep11/icons-48x48.tar"] != 1 || hits["/dists/suite/main/dep11/icons-48x48.tar.gz"] != 1 {
+		t.Fatalf("hits = %#v, want one raw attempt and one gzip fallback", hits)
 	}
 }
 

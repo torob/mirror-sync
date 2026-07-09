@@ -1,6 +1,7 @@
 package download
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ulikunitz/xz"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/torob/mirror-sync/internal/httpx"
@@ -19,11 +21,18 @@ import (
 	"github.com/torob/mirror-sync/internal/safe"
 )
 
+type Source struct {
+	RelPath    string
+	Decompress string
+}
+
 type Expected struct {
-	RelPath string
-	Size    int64
-	SHA256  string
-	Verify  func(path string) error
+	RelPath      string
+	Size         int64
+	SHA256       string
+	Verify       func(path string) error
+	VerifyOnSync bool
+	Sources      []Source
 }
 
 type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expected) error
@@ -48,7 +57,7 @@ func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []
 		g.Go(func() error {
 			for exp := range jobs {
 				if err := ensureOne(ctx, publishRoot, stagingRoot, clients, exp); err != nil {
-					return fmt.Errorf("package %s: %w", exp.RelPath, err)
+					return fmt.Errorf("file %s: %w", exp.RelPath, err)
 				}
 			}
 			return nil
@@ -93,7 +102,11 @@ func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clien
 	if err != nil {
 		return err
 	}
-	if ok, err := publish.Verify(final, publish.WithSize(expected.Size)); err != nil {
+	options := []publish.VerifyOption{publish.WithSize(expected.Size)}
+	if expected.VerifyOnSync {
+		options = append(options, publish.WithSHA256(expected.SHA256), publish.WithCheck(expected.Verify))
+	}
+	if ok, err := publish.Verify(final, options...); err != nil {
 		return err
 	} else if ok {
 		return nil
@@ -140,8 +153,8 @@ func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, cli
 func downloadAndPublish(ctx context.Context, publishRoot string, clients []*httpx.Client, expected Expected, staged, final string) error {
 	var failures []string
 	for _, client := range clients {
-		if err := downloadOne(ctx, client, expected, staged); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", client.URL(expected.RelPath), err))
+		if err := downloadFromClient(ctx, client, expected, staged); err != nil {
+			failures = append(failures, err.Error())
 			continue
 		}
 		if expected.Verify != nil {
@@ -156,7 +169,26 @@ func downloadAndPublish(ctx context.Context, publishRoot string, clients []*http
 	return fmt.Errorf("all sources failed for %s: %s", expected.RelPath, strings.Join(failures, "; "))
 }
 
-func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, staged string) error {
+func downloadFromClient(ctx context.Context, client *httpx.Client, expected Expected, staged string) error {
+	var failures []string
+	sources := expected.Sources
+	if len(sources) == 0 {
+		sources = []Source{{RelPath: expected.RelPath}}
+	}
+	for _, source := range sources {
+		if source.RelPath == "" {
+			source.RelPath = expected.RelPath
+		}
+		if err := downloadOne(ctx, client, expected, source, staged); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", client.URL(source.RelPath), err))
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(failures, "; "))
+}
+
+func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, source Source, staged string) error {
 	if err := os.MkdirAll(filepath.Dir(staged), 0o755); err != nil {
 		return err
 	}
@@ -165,15 +197,22 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 	var out *os.File
 	var h hash.Hash
 	var written int64
-	err := client.Do(ctx, expected.RelPath, func(resp *http.Response) error {
+	err := client.Do(ctx, source.RelPath, func(resp *http.Response) error {
 		var err error
 		out, err = os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
 		defer out.Close()
+		body, closeBody, err := decompressedBody(resp.Body, source.Decompress)
+		if err != nil {
+			return err
+		}
+		if closeBody {
+			defer body.Close()
+		}
 		h = sha256.New()
-		written, err = io.CopyBuffer(io.MultiWriter(out, h), resp.Body, make([]byte, 128*1024))
+		written, err = io.CopyBuffer(io.MultiWriter(out, h), body, make([]byte, 128*1024))
 		if err != nil {
 			return err
 		}
@@ -202,4 +241,25 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 		return err
 	}
 	return nil
+}
+
+func decompressedBody(body io.ReadCloser, compression string) (io.ReadCloser, bool, error) {
+	switch compression {
+	case "":
+		return body, false, nil
+	case "gzip":
+		zr, err := gzip.NewReader(body)
+		if err != nil {
+			return nil, false, err
+		}
+		return zr, true, nil
+	case "xz":
+		xzr, err := xz.NewReader(body)
+		if err != nil {
+			return nil, false, err
+		}
+		return io.NopCloser(xzr), true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported source decompression %q", compression)
+	}
 }

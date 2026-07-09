@@ -50,7 +50,7 @@ func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
 	}
 	return model.RepositoryPlan{
 		Name: r.Repo.Name, Kind: "apt", PublishPath: r.Repo.AbsPublishPath,
-		MetadataFiles: len(state.Metadata), Packages: len(state.Packages), Bytes: bytes,
+		MetadataFiles: len(state.Metadata) + len(state.Files), Packages: len(state.Packages), Bytes: bytes,
 		Sources: r.sourceDescriptions(),
 	}, nil
 }
@@ -88,7 +88,7 @@ func (r *Runner) Verify(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	state, err := r.readPublishedState()
+	releaseState, err := r.readPublishedReleaseState()
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,14 @@ func (r *Runner) Verify(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state)); err != nil {
+	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(releaseState.Files)); err != nil {
+		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
+	state, err := r.readPublishedState()
+	if err != nil {
+		return err
+	}
+	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages)); err != nil {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	return nil
@@ -110,6 +117,9 @@ func (r *Runner) Prune(ctx context.Context) ([]string, error) {
 	keep := map[string]bool{}
 	for _, mf := range state.Metadata {
 		keep[mf.Path] = true
+	}
+	for _, f := range state.Files {
+		keep[f.Path] = true
 	}
 	for rel := range state.Packages {
 		keep[rel] = true
@@ -139,13 +149,23 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 		}
 		_ = releaseText
 		out.Metadata = append(out.Metadata, metadata...)
+		files, err := selectReleaseFiles(suite, r.Repo.Architectures, releaseHashes)
+		if err != nil {
+			return out, err
+		}
+		out.Files = append(out.Files, files...)
 		for _, component := range suite.Components {
-			for _, arch := range r.Repo.Architectures {
-				indexRel, indexData, err := r.fetchPackagesIndex(ctx, client, suite.Name, component, arch, releaseHashes)
+			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
+				indexRel, indexData, found, err := r.fetchPackagesIndex(ctx, client, suite.Name, component, arch, releaseHashes)
 				if err != nil {
 					return out, err
 				}
-				out.Metadata = append(out.Metadata, model.MetadataFile{Path: path.Join("dists", suite.Name, indexRel), Data: indexData})
+				if !found {
+					if arch == "all" {
+						continue
+					}
+					return out, fmt.Errorf("apt %s no Packages index for %s/%s/%s", r.Repo.Name, suite.Name, component, arch)
+				}
 				pkgs, err := parsePackages(decompressIndex(indexRel, indexData))
 				if err != nil {
 					return out, fmt.Errorf("apt %s parse %s: %w", r.Repo.Name, indexRel, err)
@@ -196,7 +216,7 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 	}, nil
 }
 
-func (r *Runner) fetchPackagesIndex(ctx context.Context, client *httpx.Client, suite, component, arch string, hashes map[string]releaseFile) (string, []byte, error) {
+func (r *Runner) fetchPackagesIndex(ctx context.Context, client *httpx.Client, suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
 	candidates := []string{
 		path.Join(component, "binary-"+arch, "Packages.xz"),
 		path.Join(component, "binary-"+arch, "Packages.gz"),
@@ -209,18 +229,58 @@ func (r *Runner) fetchPackagesIndex(ctx context.Context, client *httpx.Client, s
 		}
 		data, err := client.GetBytes(ctx, path.Join("dists", suite, rel), want.Size+1)
 		if err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 		got := sha256.Sum256(data)
 		if int64(len(data)) != want.Size || !strings.EqualFold(hex.EncodeToString(got[:]), want.SHA256) {
-			return "", nil, fmt.Errorf("apt %s index %s checksum mismatch", r.Repo.Name, rel)
+			return "", nil, false, fmt.Errorf("apt %s index %s checksum mismatch", r.Repo.Name, rel)
 		}
-		return rel, data, nil
+		return rel, data, true, nil
 	}
-	return "", nil, fmt.Errorf("apt %s no Packages index for %s/%s/%s", r.Repo.Name, suite, component, arch)
+	return "", nil, false, nil
 }
 
 func (r *Runner) readPublishedState() (model.RepositoryState, error) {
+	out, err := r.readPublishedReleaseState()
+	if err != nil {
+		return out, err
+	}
+	hashesBySuite := map[string]map[string]releaseFile{}
+	for _, suite := range r.Repo.Suites {
+		hashes, err := r.readPublishedReleaseHashes(suite.Name)
+		if err != nil {
+			return out, err
+		}
+		hashesBySuite[suite.Name] = hashes
+	}
+	for _, suite := range r.Repo.Suites {
+		hashes := hashesBySuite[suite.Name]
+		for _, component := range suite.Components {
+			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
+				indexRel, data, found, err := r.readPublishedIndex(suite.Name, component, arch, hashes)
+				if err != nil {
+					return out, err
+				}
+				if !found {
+					if arch == "all" {
+						continue
+					}
+					return out, fmt.Errorf("no published Packages index for %s/%s/%s", suite.Name, component, arch)
+				}
+				pkgs, err := parsePackages(decompressIndex(indexRel, data))
+				if err != nil {
+					return out, err
+				}
+				for _, pkg := range pkgs {
+					out.Packages[pkg.Path] = pkg
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 	keyring, err := loadKeyring(r.Repo.AbsKeyring)
 	if err != nil {
 		return model.RepositoryState{}, err
@@ -263,27 +323,45 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 			out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData}, model.MetadataFile{Path: sigRel, Data: sig, SignedLast: true})
 		}
 		_ = releaseText
-		for _, component := range suite.Components {
-			for _, arch := range r.Repo.Architectures {
-				indexRel, data, err := r.readPublishedIndex(suite.Name, component, arch, hashes)
-				if err != nil {
-					return out, err
-				}
-				out.Metadata = append(out.Metadata, model.MetadataFile{Path: path.Join("dists", suite.Name, indexRel), Data: data})
-				pkgs, err := parsePackages(decompressIndex(indexRel, data))
-				if err != nil {
-					return out, err
-				}
-				for _, pkg := range pkgs {
-					out.Packages[pkg.Path] = pkg
-				}
-			}
+		files, err := selectReleaseFiles(suite, r.Repo.Architectures, hashes)
+		if err != nil {
+			return out, err
 		}
+		out.Files = append(out.Files, files...)
 	}
 	return out, nil
 }
 
-func (r *Runner) readPublishedIndex(suite, component, arch string, hashes map[string]releaseFile) (string, []byte, error) {
+func (r *Runner) readPublishedReleaseHashes(suite string) (map[string]releaseFile, error) {
+	keyring, err := loadKeyring(r.Repo.AbsKeyring)
+	if err != nil {
+		return nil, err
+	}
+	inReleaseRel := path.Join("dists", suite, "InRelease")
+	if data, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, inReleaseRel)); err == nil {
+		plain, err := verifyInRelease(data, keyring)
+		if err != nil {
+			return nil, err
+		}
+		return parseReleaseHashes(string(plain))
+	}
+	releaseRel := path.Join("dists", suite, "Release")
+	sigRel := path.Join("dists", suite, "Release.gpg")
+	releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel))
+	if err != nil {
+		return nil, err
+	}
+	sig, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, sigRel))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
+		return nil, err
+	}
+	return parseReleaseHashes(string(releaseData))
+}
+
+func (r *Runner) readPublishedIndex(suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
 	for _, rel := range []string{path.Join(component, "binary-"+arch, "Packages.xz"), path.Join(component, "binary-"+arch, "Packages.gz"), path.Join(component, "binary-"+arch, "Packages")} {
 		want, ok := hashes[rel]
 		if !ok {
@@ -291,15 +369,18 @@ func (r *Runner) readPublishedIndex(suite, component, arch string, hashes map[st
 		}
 		data, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, path.Join("dists", suite, rel)))
 		if err != nil {
-			return "", nil, err
+			if os.IsNotExist(err) {
+				continue
+			}
+			return "", nil, false, err
 		}
 		got := sha256.Sum256(data)
 		if int64(len(data)) != want.Size || !strings.EqualFold(hex.EncodeToString(got[:]), want.SHA256) {
-			return "", nil, fmt.Errorf("published apt index %s checksum mismatch", rel)
+			continue
 		}
-		return rel, data, nil
+		return rel, data, true, nil
 	}
-	return "", nil, fmt.Errorf("no published Packages index for %s/%s/%s", suite, component, arch)
+	return "", nil, false, nil
 }
 
 func loadKeyring(path string) (openpgp.EntityList, error) {
@@ -349,6 +430,161 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 		}
 	}
 	return out, nil
+}
+
+func selectReleaseFiles(suite config.APTSuite, architectures []string, hashes map[string]releaseFile) ([]model.RepositoryFile, error) {
+	components := setFromSlice(suite.Components)
+	selected := selectedRealArchitectures(architectures)
+	packageArchitectures := setFromSlice(packageIndexArchitectures(architectures))
+	rels := make([]string, 0, len(hashes))
+	for rel := range hashes {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	var out []model.RepositoryFile
+	for _, rel := range rels {
+		cleanRel, err := safe.Rel(rel)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldMirrorReleaseFile(cleanRel, components, selected, packageArchitectures) {
+			continue
+		}
+		publishedRel, err := safe.Rel(path.Join("dists", suite.Name, cleanRel))
+		if err != nil {
+			return nil, err
+		}
+		file := hashes[rel]
+		out = append(out, model.RepositoryFile{Path: publishedRel, Size: file.Size, SHA256: file.SHA256})
+	}
+	return out, nil
+}
+
+func shouldMirrorReleaseFile(rel string, components, selectedArchs, packageArchs map[string]bool) bool {
+	parts := strings.Split(rel, "/")
+	if len(parts) == 1 {
+		if arch, ok := contentsArch(parts[0]); ok {
+			return selectedArchs[arch]
+		}
+		return false
+	}
+	if !components[parts[0]] {
+		return false
+	}
+	rest := strings.Join(parts[1:], "/")
+	if arch, ok := binaryDirArch(rest); ok {
+		return packageArchs[arch]
+	}
+	if arch, ok := installerBinaryArch(rest); ok {
+		return selectedArchs[arch]
+	}
+	if arch, ok := cnfArch(rest); ok {
+		return selectedArchs[arch]
+	}
+	if arch, ok := dep11ComponentsArch(rest); ok {
+		return selectedArchs[arch]
+	}
+	if arch, ok := dep11CIDIndexArch(rest); ok {
+		return selectedArchs[arch]
+	}
+	if arch, ok := contentsArch(path.Base(rest)); ok {
+		return selectedArchs[arch]
+	}
+	return true
+}
+
+func packageIndexArchitectures(architectures []string) []string {
+	out := make([]string, 0, len(architectures)+1)
+	seen := map[string]bool{}
+	for _, arch := range architectures {
+		if arch == "" || seen[arch] {
+			continue
+		}
+		seen[arch] = true
+		out = append(out, arch)
+	}
+	if !seen["all"] {
+		out = append(out, "all")
+	}
+	return out
+}
+
+func selectedRealArchitectures(architectures []string) map[string]bool {
+	out := map[string]bool{}
+	for _, arch := range architectures {
+		if arch != "" && arch != "all" {
+			out[arch] = true
+		}
+	}
+	return out
+}
+
+func setFromSlice(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		out[value] = true
+	}
+	return out
+}
+
+func binaryDirArch(rel string) (string, bool) {
+	parts := strings.Split(rel, "/")
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "binary-") {
+		return "", false
+	}
+	return strings.TrimPrefix(parts[0], "binary-"), true
+}
+
+func installerBinaryArch(rel string) (string, bool) {
+	parts := strings.Split(rel, "/")
+	if len(parts) < 3 || parts[0] != "debian-installer" || !strings.HasPrefix(parts[1], "binary-") {
+		return "", false
+	}
+	return strings.TrimPrefix(parts[1], "binary-"), true
+}
+
+func cnfArch(rel string) (string, bool) {
+	base := trimIndexCompression(path.Base(rel))
+	if !strings.HasPrefix(base, "Commands-") {
+		return "", false
+	}
+	return strings.TrimPrefix(base, "Commands-"), true
+}
+
+func dep11ComponentsArch(rel string) (string, bool) {
+	base := trimIndexCompression(path.Base(rel))
+	if !strings.HasPrefix(base, "Components-") || !strings.HasSuffix(base, ".yml") {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, "Components-"), ".yml"), true
+}
+
+func dep11CIDIndexArch(rel string) (string, bool) {
+	base := trimIndexCompression(path.Base(rel))
+	if !strings.HasPrefix(base, "CID-Index-") || !strings.HasSuffix(base, ".json") {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, "CID-Index-"), ".json"), true
+}
+
+func contentsArch(name string) (string, bool) {
+	base := trimIndexCompression(name)
+	if !strings.HasPrefix(base, "Contents-") {
+		return "", false
+	}
+	arch := strings.TrimPrefix(base, "Contents-")
+	arch = strings.TrimPrefix(arch, "udeb-")
+	if arch == "" {
+		return "", false
+	}
+	return arch, true
+}
+
+func trimIndexCompression(name string) string {
+	for _, suffix := range []string{".gz", ".xz"} {
+		name = strings.TrimSuffix(name, suffix)
+	}
+	return name
 }
 
 func decompressIndex(rel string, data []byte) ([]byte, error) {
@@ -460,12 +696,58 @@ func sortedPackages(m map[string]model.Package) []model.Package {
 
 func aptExpected(state model.RepositoryState) []download.Expected {
 	var expected []download.Expected
-	for _, pkg := range sortedPackages(state.Packages) {
+	expected = append(expected, aptFileExpected(state.Files)...)
+	expected = append(expected, aptPackageExpected(state.Packages)...)
+	return expected
+}
+
+func aptPackageExpected(packages map[string]model.Package) []download.Expected {
+	var expected []download.Expected
+	for _, pkg := range sortedPackages(packages) {
 		expected = append(expected, download.Expected{
 			RelPath: pkg.Path, Size: pkg.Size, SHA256: pkg.SHA256,
 		})
 	}
 	return expected
+}
+
+func aptFileExpected(files []model.RepositoryFile) []download.Expected {
+	files = sortedFiles(files)
+	fileSet := map[string]bool{}
+	for _, f := range files {
+		fileSet[f.Path] = true
+	}
+	expected := make([]download.Expected, 0, len(files))
+	for _, f := range files {
+		expected = append(expected, download.Expected{
+			RelPath:      f.Path,
+			Size:         f.Size,
+			SHA256:       f.SHA256,
+			VerifyOnSync: true,
+			Sources:      releaseFileSources(f.Path, fileSet),
+		})
+	}
+	return expected
+}
+
+func sortedFiles(files []model.RepositoryFile) []model.RepositoryFile {
+	out := append([]model.RepositoryFile(nil), files...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+func releaseFileSources(rel string, fileSet map[string]bool) []download.Source {
+	sources := []download.Source{{RelPath: rel}}
+	if strings.HasSuffix(rel, ".gz") || strings.HasSuffix(rel, ".xz") {
+		return sources
+	}
+	if fileSet[rel+".xz"] {
+		sources = append(sources, download.Source{RelPath: rel + ".xz", Decompress: "xz"})
+	}
+	if fileSet[rel+".gz"] {
+		sources = append(sources, download.Source{RelPath: rel + ".gz", Decompress: "gzip"})
+	}
+	return sources
 }
 
 func repoStaging(cfg *config.Config, kind, name string) string {

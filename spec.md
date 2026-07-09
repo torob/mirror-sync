@@ -598,15 +598,21 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 - Fall back to `Release` plus `Release.gpg` when `InRelease` is unavailable.
 - Verify upstream OpenPGP signatures in-process with the configured `keyring`.
 - Parse the verified `Release` metadata.
-- Download referenced `Packages.*` indexes from `primary_source`.
-- Verify each package index against hashes from the verified `Release` file.
-- Parse package entries for at least `Filename`, `Size`, and `SHA256`.
-- Reuse existing published `.deb` payloads when they are regular files and
-  their size matches verified package metadata.
-- Download missing or wrong-size `.deb` payloads from `mirror_sources` in order
-  when configured, then from `primary_source` as the final fallback.
-- Accept a newly downloaded `.deb` only when its size and SHA256 match the
-  verified package metadata.
+- Download referenced `Packages.*`, Debian Installer `Packages.*`, and
+  `Sources.*` indexes from `primary_source`.
+- Verify each index against hashes from the verified `Release` file, preferring
+  the strongest supported checksum present.
+- Parse binary package entries for `Architecture`, `Filename`, `Size`, and a
+  supported checksum, and keep only configured architectures plus `all`.
+- Parse source package entries from `Sources.*` and mirror the referenced
+  source payload files.
+- Reuse existing published APT payloads when they are regular files and their
+  size matches verified package metadata.
+- Download missing or wrong-size `.deb`, `.udeb`, and source payloads from
+  `mirror_sources` in order when configured, then from `primary_source` as the
+  final fallback.
+- Accept a newly downloaded APT payload only when its size and strongest
+  supported checksum match verified metadata.
 - Preserve upstream files under `dists/` unchanged in the published mirror.
 
 If a mirror source returns a missing, incomplete, or checksum-invalid payload,
@@ -747,8 +753,10 @@ For APT repositories, verification must confirm:
 
 - Published metadata signatures validate with the configured keyring.
 - Published package indexes match hashes in the verified `Release` metadata.
-- Referenced package files exist, or are repaired from payload sources.
-- Referenced package files match expected size and SHA256 after repair.
+- Referenced binary, installer, and source payload files exist, or are repaired
+  from payload sources.
+- Referenced APT payload files match expected size and strongest supported
+  checksum after repair.
 
 For APK repositories, verification must confirm:
 

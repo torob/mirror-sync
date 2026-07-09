@@ -1,9 +1,13 @@
 package publish
 
 import (
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -77,6 +81,22 @@ func (c SHA256Check) Verify(path string, _ os.FileInfo) (bool, error) {
 	return strings.EqualFold(got, c.SHA256), nil
 }
 
+type ChecksumCheck struct {
+	Algorithm string
+	Hex       string
+}
+
+func (c ChecksumCheck) Verify(path string, _ os.FileInfo) (bool, error) {
+	if c.Hex == "" {
+		return true, nil
+	}
+	got, err := checksumFile(path, c.Algorithm)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(got, c.Hex), nil
+}
+
 type FuncCheck struct {
 	Check func(path string) error
 }
@@ -97,6 +117,10 @@ func WithSize(size int64) VerifyOption {
 
 func WithSHA256(shaHex string) VerifyOption {
 	return SHA256Check{SHA256: shaHex}
+}
+
+func WithChecksum(algorithm, hex string) VerifyOption {
+	return ChecksumCheck{Algorithm: algorithm, Hex: hex}
 }
 
 func WithCheck(check func(path string) error) VerifyOption {
@@ -127,16 +151,38 @@ func Verify(path string, options ...VerifyOption) (bool, error) {
 }
 
 func sha256File(path string) (string, error) {
+	return checksumFile(path, "SHA256")
+}
+
+func checksumFile(path, algorithm string) (string, error) {
+	h, err := newHash(algorithm)
+	if err != nil {
+		return "", err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func newHash(algorithm string) (hash.Hash, error) {
+	switch strings.ToUpper(algorithm) {
+	case "MD5", "MD5SUM":
+		return md5.New(), nil
+	case "SHA1":
+		return sha1.New(), nil
+	case "SHA256":
+		return sha256.New(), nil
+	case "SHA512":
+		return sha512.New(), nil
+	default:
+		return nil, fmt.Errorf("unsupported checksum algorithm %q", algorithm)
+	}
 }
 
 func AtomicWrite(root, stagingRoot, rel string, data []byte) error {

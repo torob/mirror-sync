@@ -2,6 +2,7 @@ package publish
 
 import (
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -70,6 +71,8 @@ func TestVerifyOptions(t *testing.T) {
 	}
 	sum := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(sum[:])
+	sha512Sum := sha512.Sum512(data)
+	sha512Hex := hex.EncodeToString(sha512Sum[:])
 
 	tests := []struct {
 		name string
@@ -111,6 +114,12 @@ func TestVerifyOptions(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "matching generic sha512",
+			path: file,
+			opts: []VerifyOption{ChecksumCheck{Algorithm: "SHA512", Hex: sha512Hex}},
+			want: true,
+		},
+		{
 			name: "wrong sha256",
 			path: file,
 			opts: []VerifyOption{SHA256Check{SHA256: "000000"}},
@@ -146,6 +155,7 @@ func TestVerifyOptions(t *testing.T) {
 			opts: []VerifyOption{
 				WithSize(int64(len(data))),
 				WithSHA256(shaHex),
+				WithChecksum("SHA512", sha512Hex),
 				WithCheck(func(string) error { return nil }),
 			},
 			want: true,

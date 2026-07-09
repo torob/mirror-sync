@@ -2,6 +2,7 @@ package apt
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/torob/mirror-sync/internal/config"
@@ -110,6 +111,98 @@ func TestPackageIndexArchitecturesAddsImplicitAll(t *testing.T) {
 	}
 }
 
+func TestParseReleaseHashesKeepsAllSupportedChecksums(t *testing.T) {
+	hashes, err := parseReleaseHashes(`Origin: example
+MD5Sum:
+ 11111111111111111111111111111111 12 main/binary-amd64/Packages.gz
+SHA256:
+ 2222222222222222222222222222222222222222222222222222222222222222 12 main/binary-amd64/Packages.gz
+SHA512:
+ 33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333 12 main/binary-amd64/Packages.gz
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := hashes["main/binary-amd64/Packages.gz"]
+	if got.Size != 12 {
+		t.Fatalf("size = %d, want 12", got.Size)
+	}
+	if got.Checksums["MD5Sum"] == "" || got.Checksums["SHA256"] == "" || got.Checksums["SHA512"] == "" {
+		t.Fatalf("checksums = %#v, want md5/sha256/sha512", got.Checksums)
+	}
+}
+
+func TestParseReleaseHashesRejectsConflictingEntries(t *testing.T) {
+	_, err := parseReleaseHashes(`SHA256:
+ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 12 main/binary-amd64/Packages.gz
+ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 12 main/binary-amd64/Packages.gz
+`)
+	if err == nil {
+		t.Fatal("parseReleaseHashes succeeded, want conflict error")
+	}
+}
+
+func TestParsePackagesFiltersArchitecturesAndCarriesChecksums(t *testing.T) {
+	pkgs, err := parsePackages([]byte(`Package: native
+Architecture: amd64
+Filename: pool/main/n/native/native_1_amd64.deb
+Size: 10
+SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+Package: indep
+Architecture: all
+Filename: pool/main/i/indep/indep_1_all.deb
+Size: 11
+SHA512: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+Package: foreign
+Architecture: arm64
+Filename: pool/main/f/foreign/foreign_1_arm64.deb
+Size: 12
+SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+`), nil, map[string]bool{"amd64": true, "all": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := packagePaths(pkgs)
+	want := []string{
+		"pool/main/i/indep/indep_1_all.deb",
+		"pool/main/n/native/native_1_amd64.deb",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("packages = %#v, want %#v", got, want)
+	}
+	if pkgs[1].Checksums["SHA512"] == "" {
+		t.Fatalf("checksums = %#v, want SHA512 on arch-all package", pkgs[1].Checksums)
+	}
+}
+
+func TestParseSourcesExpandsSourcePayloads(t *testing.T) {
+	pkgs, err := parseSources([]byte(`Package: hello
+Directory: pool/main/h/hello
+Files:
+ 11111111111111111111111111111111 5 hello_1.dsc
+ 22222222222222222222222222222222 6 hello_1.tar.xz
+Checksums-Sha256:
+ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 5 hello_1.dsc
+ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 6 hello_1.tar.xz
+`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := packagePaths(pkgs)
+	want := []string{
+		"pool/main/h/hello/hello_1.dsc",
+		"pool/main/h/hello/hello_1.tar.xz",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("source payloads = %#v, want %#v", got, want)
+	}
+	if pkgs[0].Checksums["MD5Sum"] == "" || pkgs[0].Checksums["SHA256"] == "" {
+		t.Fatalf("checksums = %#v, want MD5Sum and SHA256", pkgs[0].Checksums)
+	}
+}
+
 func TestAptFileExpectedVerifiesAndCanMaterializeRawFromCompressedSiblings(t *testing.T) {
 	expected := aptFileExpected([]model.RepositoryFile{
 		{Path: "dists/resolute/main/dep11/icons-48x48.tar", Size: 100, SHA256: "raw"},
@@ -148,7 +241,7 @@ func boolPtr(v bool) *bool {
 func releaseHashesFromPaths(paths ...string) map[string]releaseFile {
 	out := map[string]releaseFile{}
 	for i, p := range paths {
-		out[p] = releaseFile{Size: int64(i + 1), SHA256: "sha"}
+		out[p] = releaseFile{Size: int64(i + 1), Checksums: map[string]string{"SHA256": "sha"}}
 	}
 	return out
 }
@@ -158,6 +251,15 @@ func filePaths(files []model.RepositoryFile) []string {
 	for _, file := range files {
 		out = append(out, file.Path)
 	}
+	return out
+}
+
+func packagePaths(packages []model.Package) []string {
+	out := make([]string, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, pkg.Path)
+	}
+	sort.Strings(out)
 	return out
 }
 

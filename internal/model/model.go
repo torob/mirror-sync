@@ -1,10 +1,11 @@
 package model
 
 type Package struct {
-	Path    string
-	Size    int64
-	SHA256  string
-	APKHash string
+	Path      string
+	Size      int64
+	SHA256    string
+	Checksums map[string]string
+	APKHash   string
 }
 
 type MetadataFile struct {
@@ -14,9 +15,10 @@ type MetadataFile struct {
 }
 
 type RepositoryFile struct {
-	Path   string
-	Size   int64
-	SHA256 string
+	Path      string
+	Size      int64
+	SHA256    string
+	Checksums map[string]string
 }
 
 type RepositoryPlan struct {

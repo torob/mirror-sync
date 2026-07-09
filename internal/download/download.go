@@ -3,7 +3,10 @@ package download
 import (
 	"compress/gzip"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"hash"
@@ -30,6 +33,7 @@ type Expected struct {
 	RelPath      string
 	Size         int64
 	SHA256       string
+	Checksums    map[string]string
 	Verify       func(path string) error
 	VerifyOnSync bool
 	Sources      []Source
@@ -104,7 +108,7 @@ func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clien
 	}
 	options := []publish.VerifyOption{publish.WithSize(expected.Size)}
 	if expected.VerifyOnSync {
-		options = append(options, publish.WithSHA256(expected.SHA256), publish.WithCheck(expected.Verify))
+		options = append(options, checksumVerifyOption(expected), publish.WithCheck(expected.Verify))
 	}
 	if ok, err := publish.Verify(final, options...); err != nil {
 		return err
@@ -126,7 +130,7 @@ func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, cli
 	}
 	if ok, err := publish.Verify(final,
 		publish.WithSize(expected.Size),
-		publish.WithSHA256(expected.SHA256),
+		checksumVerifyOption(expected),
 		publish.WithCheck(expected.Verify),
 	); err != nil {
 		return err
@@ -139,7 +143,7 @@ func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, cli
 	}
 	if ok, err := publish.Verify(staged,
 		publish.WithSize(expected.Size),
-		publish.WithSHA256(expected.SHA256),
+		checksumVerifyOption(expected),
 		publish.WithCheck(expected.Verify),
 	); err != nil {
 		return err
@@ -195,7 +199,8 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 	tmp := staged + ".partial"
 	os.Remove(tmp)
 	var out *os.File
-	var h hash.Hash
+	checksumAlg, checksumHex := strongestChecksum(expected)
+	var gotChecksum string
 	var written int64
 	err := client.Do(ctx, source.RelPath, func(resp *http.Response) error {
 		var err error
@@ -211,10 +216,20 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 		if closeBody {
 			defer body.Close()
 		}
-		h = sha256.New()
-		written, err = io.CopyBuffer(io.MultiWriter(out, h), body, make([]byte, 128*1024))
+		var h hash.Hash
+		if checksumAlg != "" {
+			h = newHash(checksumAlg)
+		}
+		writer := io.Writer(out)
+		if h != nil {
+			writer = io.MultiWriter(out, h)
+		}
+		written, err = io.CopyBuffer(writer, body, make([]byte, 128*1024))
 		if err != nil {
 			return err
+		}
+		if h != nil {
+			gotChecksum = hex.EncodeToString(h.Sum(nil))
 		}
 		if err := out.Sync(); err != nil {
 			return err
@@ -229,11 +244,10 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 		os.Remove(tmp)
 		return fmt.Errorf("size mismatch got %d want %d", written, expected.Size)
 	}
-	if expected.SHA256 != "" {
-		got := hex.EncodeToString(h.Sum(nil))
-		if !strings.EqualFold(got, expected.SHA256) {
+	if checksumAlg != "" {
+		if !strings.EqualFold(gotChecksum, checksumHex) {
 			os.Remove(tmp)
-			return fmt.Errorf("sha256 mismatch got %s want %s", got, expected.SHA256)
+			return fmt.Errorf("%s mismatch got %s want %s", strings.ToLower(checksumAlg), gotChecksum, checksumHex)
 		}
 	}
 	if err := os.Rename(tmp, staged); err != nil {
@@ -241,6 +255,51 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 		return err
 	}
 	return nil
+}
+
+func checksumVerifyOption(expected Expected) publish.VerifyOption {
+	alg, hex := strongestChecksum(expected)
+	if alg == "" {
+		return nil
+	}
+	return publish.WithChecksum(alg, hex)
+}
+
+func strongestChecksum(expected Expected) (string, string) {
+	checksums := expected.Checksums
+	if len(checksums) == 0 && expected.SHA256 != "" {
+		checksums = map[string]string{"SHA256": expected.SHA256}
+	}
+	for _, alg := range []string{"SHA512", "SHA256", "SHA1", "MD5Sum", "MD5"} {
+		for name, value := range checksums {
+			if strings.EqualFold(name, alg) && value != "" {
+				return canonicalChecksumName(name), value
+			}
+		}
+	}
+	return "", ""
+}
+
+func canonicalChecksumName(name string) string {
+	if strings.EqualFold(name, "MD5Sum") {
+		return "MD5"
+	}
+	return strings.ToUpper(name)
+}
+
+func newHash(algorithm string) hash.Hash {
+	switch strings.ToUpper(algorithm) {
+	case "MD5", "MD5SUM":
+		return md5.New()
+	case "SHA1":
+		return sha1.New()
+	case "SHA256":
+		return sha256.New()
+	case "SHA512":
+		return sha512.New()
+	default:
+		return nil
+	}
 }
 
 func decompressedBody(body io.ReadCloser, compression string) (io.ReadCloser, bool, error) {

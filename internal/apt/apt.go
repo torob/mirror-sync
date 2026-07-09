@@ -238,7 +238,7 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 		metadata := []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}}
 		releaseRel := path.Join("dists", suite, "Release")
 		if releaseData, err := client.GetBytes(ctx, releaseRel, 64<<20); err == nil {
-			if !bytes.Equal(releaseData, plain) {
+			if !releaseMatchesVerifiedCleartext(releaseData, plain) {
 				return "", nil, nil, fmt.Errorf("apt %s %s differs from verified %s cleartext", r.Repo.Name, releaseRel, inReleaseRel)
 			}
 			metadata = append(metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
@@ -404,7 +404,7 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 			out.Metadata = append(out.Metadata, model.MetadataFile{Path: inReleaseRel, Data: data, SignedLast: true})
 			releaseRel := path.Join("dists", suite.Name, "Release")
 			if releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel)); err == nil {
-				if !bytes.Equal(releaseData, plain) {
+				if !releaseMatchesVerifiedCleartext(releaseData, plain) {
 					return out, fmt.Errorf("published %s differs from verified %s cleartext", releaseRel, inReleaseRel)
 				}
 				out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
@@ -543,6 +543,27 @@ func verifyInRelease(data []byte, keyring openpgp.EntityList) ([]byte, error) {
 		return nil, err
 	}
 	return block.Bytes, nil
+}
+
+func releaseMatchesVerifiedCleartext(releaseData, verifiedCleartext []byte) bool {
+	if bytes.Equal(releaseData, verifiedCleartext) {
+		return true
+	}
+	canonical := canonicalReleaseCleartext(releaseData)
+	if bytes.Equal(canonical, verifiedCleartext) {
+		return true
+	}
+	return bytes.Equal(trimTrailingCRLF(canonical), trimTrailingCRLF(verifiedCleartext))
+}
+
+func canonicalReleaseCleartext(data []byte) []byte {
+	normalized := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	normalized = bytes.ReplaceAll(normalized, []byte("\r"), []byte("\n"))
+	return bytes.ReplaceAll(normalized, []byte("\n"), []byte("\r\n"))
+}
+
+func trimTrailingCRLF(data []byte) []byte {
+	return bytes.TrimRight(data, "\r\n")
 }
 
 func validateClearsignedStructure(data []byte) error {

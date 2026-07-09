@@ -192,6 +192,7 @@ func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) 
 	release := []byte("Origin: example\nSHA256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n")
 	inRelease, keyring, _ := signedInRelease(t, release)
 	writePublishedInRelease(t, root, "stable", inRelease)
+	writeTestFile(t, root, "dists/stable/Release", release)
 	writeTestFile(t, root, "dists/stable/main/binary-amd64/Packages", nil)
 	runner := &Runner{Repo: config.APTRepository{
 		Name:           "repo",
@@ -207,6 +208,9 @@ func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) 
 	}
 	if len(state.Packages) != 0 {
 		t.Fatalf("packages = %d, want none", len(state.Packages))
+	}
+	if data, ok := metadataData(state.Metadata, "dists/stable/Release"); !ok || !bytes.Equal(data, release) {
+		t.Fatalf("published Release metadata = %q, ok %t, want original Release bytes", data, ok)
 	}
 }
 
@@ -295,7 +299,7 @@ func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
 		case "/dists/stable/InRelease":
 			_, _ = w.Write(inRelease)
 		case "/dists/stable/Release":
-			_, _ = w.Write(plain)
+			_, _ = w.Write(release)
 		default:
 			http.NotFound(w, r)
 		}
@@ -317,6 +321,30 @@ func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
 	want := []string{"dists/stable/InRelease", "dists/stable/Release"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("metadata paths = %#v, want %#v", got, want)
+	}
+	if data, ok := metadataData(metadata, "dists/stable/Release"); !ok || !bytes.Equal(data, release) {
+		t.Fatalf("Release metadata = %q, ok %t, want original Release bytes", data, ok)
+	}
+}
+
+func TestReleaseMatchesVerifiedCleartextCanonicalLineEndings(t *testing.T) {
+	release := []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n")
+	_, _, plain := signedInRelease(t, release)
+
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "lf-final-newline", data: release},
+		{name: "lf-extra-final-newline", data: append(append([]byte(nil), release...), '\n')},
+		{name: "crlf-final-newline", data: []byte("Origin: example\r\nSHA256:\r\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\r\n")},
+		{name: "canonical-cleartext", data: plain},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if !releaseMatchesVerifiedCleartext(tt.data, plain) {
+				t.Fatalf("releaseMatchesVerifiedCleartext() = false, want true")
+			}
+		})
 	}
 }
 
@@ -537,6 +565,15 @@ func metadataPaths(files []model.MetadataFile) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func metadataData(files []model.MetadataFile, path string) ([]byte, bool) {
+	for _, file := range files {
+		if file.Path == path {
+			return file.Data, true
+		}
+	}
+	return nil, false
 }
 
 func signedInRelease(t *testing.T, release []byte) ([]byte, openpgp.EntityList, []byte) {

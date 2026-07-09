@@ -26,7 +26,17 @@ type Expected struct {
 	Verify  func(path string) error
 }
 
-func EnsureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expected) error
+
+func EnsureSynced(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureSyncedOne)
+}
+
+func EnsureRepaired(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureRepairedOne)
+}
+
+func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected, ensureOne ensureOneFunc) error {
 	workers := workerCount(clients, len(expected))
 	if workers == 0 {
 		return nil
@@ -37,7 +47,7 @@ func EnsureMany(ctx context.Context, publishRoot, stagingRoot string, clients []
 	for i := 0; i < workers; i++ {
 		g.Go(func() error {
 			for exp := range jobs {
-				if err := Ensure(ctx, publishRoot, stagingRoot, clients, exp); err != nil {
+				if err := ensureOne(ctx, publishRoot, stagingRoot, clients, exp); err != nil {
 					return fmt.Errorf("package %s: %w", exp.RelPath, err)
 				}
 			}
@@ -78,31 +88,56 @@ func workerCount(clients []*httpx.Client, expected int) int {
 	return workers
 }
 
-func Ensure(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
+func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
 	final, err := safe.Join(publishRoot, expected.RelPath)
 	if err != nil {
 		return err
 	}
-	if ok, err := publish.VerifyPublished(final, expected.Size, expected.SHA256); err != nil {
+	if ok, err := publish.Verify(final, publish.WithSize(expected.Size)); err != nil {
 		return err
 	} else if ok {
-		if expected.Verify != nil {
-			return expected.Verify(final)
-		}
 		return nil
 	}
 	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), expected.RelPath)
 	if err != nil {
 		return err
 	}
-	if ok, err := publish.VerifyPublished(staged, expected.Size, expected.SHA256); err != nil {
+	os.Remove(staged)
+	return downloadAndPublish(ctx, clients, expected, staged, final)
+}
+
+func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
+	final, err := safe.Join(publishRoot, expected.RelPath)
+	if err != nil {
+		return err
+	}
+	if ok, err := publish.Verify(final,
+		publish.WithSize(expected.Size),
+		publish.WithSHA256(expected.SHA256),
+		publish.WithCheck(expected.Verify),
+	); err != nil {
 		return err
 	} else if ok {
-		if expected.Verify == nil || expected.Verify(staged) == nil {
-			return publishStaged(staged, final)
-		}
-		os.Remove(staged)
+		return nil
 	}
+	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), expected.RelPath)
+	if err != nil {
+		return err
+	}
+	if ok, err := publish.Verify(staged,
+		publish.WithSize(expected.Size),
+		publish.WithSHA256(expected.SHA256),
+		publish.WithCheck(expected.Verify),
+	); err != nil {
+		return err
+	} else if ok {
+		return publishStaged(staged, final)
+	}
+	os.Remove(staged)
+	return downloadAndPublish(ctx, clients, expected, staged, final)
+}
+
+func downloadAndPublish(ctx context.Context, clients []*httpx.Client, expected Expected, staged, final string) error {
 	var failures []string
 	for _, client := range clients {
 		if err := downloadOne(ctx, client, expected, staged); err != nil {

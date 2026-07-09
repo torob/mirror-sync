@@ -112,10 +112,11 @@ Commands:
 
 - `plan` reports the repositories, metadata, packages, source order, expected
   downloads, and prune candidates without modifying the publish tree.
-- `sync` downloads and verifies metadata and package payloads, then publishes a
-  complete mirror update.
-- `verify` validates the current published mirror against upstream metadata and
-  package checksums without publishing changes.
+- `sync` downloads and verifies metadata, reuses existing package payloads by
+  size, downloads missing or wrong-size payloads, verifies newly downloaded
+  payloads, then publishes a complete mirror update.
+- `verify` validates the current published mirror against local published
+  metadata and repairs missing or corrupted package payloads.
 - `prune` removes files that are not referenced by current metadata after
   confirming they are outside the active metadata set.
 - `run` starts a long-running built-in scheduler that repeatedly performs
@@ -458,14 +459,14 @@ verification.
 
 Requirements:
 
-- Before downloading a package payload, `mirrorsync` must first check whether
-  the package already exists at its final published path and matches the
-  expected size and checksum from current verified metadata. A matching
-  published payload is reused and must not be downloaded again.
-- If the package is missing from the published path, `mirrorsync` may check for
-  a previously staged payload for the same repository and relative package
-  path. A staged payload may be reused only after it is verified against the
-  current metadata.
+- During sync, before downloading a package payload, `mirrorsync` must first
+  check whether the package already exists at its final published path as a
+  regular file with the expected size. A matching published payload is reused
+  without checksum verification and must not be downloaded again.
+- If the package is missing or wrong-size at the published path, `mirrorsync`
+  downloads and verifies a fresh payload before publishing it.
+- During repair verification, a previously staged payload may be reused only
+  after it is verified against the current local metadata.
 - A verified staged payload is moved into the final published path with the
   same atomic rename semantics as a newly downloaded payload.
 - A staged payload that is partial, checksum-invalid, size-invalid, or not
@@ -591,10 +592,12 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
 - Download referenced `Packages.*` indexes from `primary_source`.
 - Verify each package index against hashes from the verified `Release` file.
 - Parse package entries for at least `Filename`, `Size`, and `SHA256`.
-- Download `.deb` payloads from `mirror_sources` in order when configured,
-  then from `primary_source` as the final fallback.
-- Accept a `.deb` only when its size and SHA256 match the verified package
-  metadata.
+- Reuse existing published `.deb` payloads when they are regular files and
+  their size matches verified package metadata.
+- Download missing or wrong-size `.deb` payloads from `mirror_sources` in order
+  when configured, then from `primary_source` as the final fallback.
+- Accept a newly downloaded `.deb` only when its size and SHA256 match the
+  verified package metadata.
 - Preserve upstream files under `dists/` unchanged in the published mirror.
 
 If a mirror source returns a missing, incomplete, or checksum-invalid payload,
@@ -609,9 +612,12 @@ must:
 - Fetch official `APKINDEX.tar.gz` from `primary_source`.
 - Verify the embedded APK index signature in-process with keys from `keys_dir`.
 - Parse package names, versions, sizes, and checksums from the verified index.
-- Download `.apk` payloads from `mirror_sources` in order when configured,
-  then from `primary_source` as the final fallback.
-- Accept an `.apk` only when it matches the verified APK index metadata.
+- Reuse existing published `.apk` payloads when they are regular files and
+  their size matches verified APK index metadata.
+- Download missing or wrong-size `.apk` payloads from `mirror_sources` in order
+  when configured, then from `primary_source` as the final fallback.
+- Accept a newly downloaded `.apk` only when it matches the verified APK index
+  metadata.
 - Preserve upstream `APKINDEX.tar.gz` unchanged in the published mirror.
 
 If a mirror source returns a missing, incomplete, or checksum-invalid payload,
@@ -691,8 +697,8 @@ Requirements:
 - It is safe for clients to observe extra valid package payloads that are not
   referenced by the currently published metadata.
 - Metadata is staged separately and must not be published until every package
-  payload referenced by that metadata is present and verified in the published
-  tree.
+  payload referenced by that metadata is present in the published tree with the
+  expected size.
 - After acquiring the repository lock, staged metadata left by previous
   interrupted sync attempts must be deleted or ignored. Each sync must fetch
   and verify authoritative metadata from `primary_source` before deciding which
@@ -707,20 +713,25 @@ Requirements:
 
 ## Verification Semantics
 
-`verify` checks the published repository state without modifying it.
+`verify` checks the published repository state against local published metadata.
+It does not fetch upstream metadata. When referenced package payloads are
+missing or invalid, it downloads replacement payloads from configured payload
+sources, verifies them against local metadata, and publishes the repaired
+payloads.
 
 For APT repositories, verification must confirm:
 
 - Published metadata signatures validate with the configured keyring.
 - Published package indexes match hashes in the verified `Release` metadata.
-- Referenced package files exist.
-- Referenced package files match expected size and SHA256.
+- Referenced package files exist, or are repaired from payload sources.
+- Referenced package files match expected size and SHA256 after repair.
 
 For APK repositories, verification must confirm:
 
 - Published `APKINDEX.tar.gz` validates with the configured keys.
-- Referenced package files exist.
-- Referenced package files match expected metadata from the verified index.
+- Referenced package files exist, or are repaired from payload sources.
+- Referenced package files match expected metadata from the verified index after
+  repair.
 
 ## Failure Handling
 
@@ -759,8 +770,8 @@ For APK repositories, verification must confirm:
   and does not require cron, systemd timers, shell loops, or other external
   schedulers.
 - `mirrorsync run` always performs an immediate startup sync after successful
-  validation to verify and reconcile repository integrity before waiting for
-  scheduled cycles.
+  validation to reconcile repository contents before waiting for scheduled
+  cycles.
 - `mirrorsync run` can start sync cycles from a configured crontab-style
   expression, such as `"0 3 * * *"` in a configured timezone.
 - Scheduled sync cycles do not overlap, and a failed scheduled cycle does not
@@ -815,9 +826,10 @@ For APK repositories, verification must confirm:
 - Corrupt partial downloads are never accepted.
 - Verified package payloads are moved from staging to the published tree with
   atomic same-filesystem renames, not cross-filesystem copy-and-delete moves.
-- Already published package payloads and valid staged payloads are reused after
-  checksum and size verification instead of being downloaded again.
+- During sync, already published package payloads are reused after regular-file
+  and size checks instead of being downloaded again.
 - Metadata is not published before every referenced package file is present.
 - Prune keeps all files referenced by current metadata.
 - `plan` reports intended actions without changing the publish tree.
-- `verify` detects missing or checksum-invalid published package files.
+- `verify` detects and repairs missing or checksum-invalid published package
+  files.

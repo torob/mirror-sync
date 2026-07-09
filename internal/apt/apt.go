@@ -69,13 +69,7 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var expected []download.Expected
-	for _, pkg := range sortedPackages(state.Packages) {
-		expected = append(expected, download.Expected{
-			RelPath: pkg.Path, Size: pkg.Size, SHA256: pkg.SHA256,
-		})
-	}
-	if err := download.EnsureMany(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, expected); err != nil {
+	if err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state)); err != nil {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), state.Metadata); err != nil {
@@ -89,24 +83,22 @@ func (r *Runner) Sync(ctx context.Context) error {
 }
 
 func (r *Runner) Verify(ctx context.Context) error {
+	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apt", r.Repo.Name)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	state, err := r.readPublishedState()
 	if err != nil {
 		return err
 	}
-	for _, pkg := range state.Packages {
-		final, err := safe.Join(r.Repo.AbsPublishPath, pkg.Path)
-		if err != nil {
-			return err
-		}
-		ok, err := publish.VerifyPublished(final, pkg.Size, pkg.SHA256)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("apt %s package %s failed verification", r.Repo.Name, pkg.Path)
-		}
+	clients, err := r.payloadClients()
+	if err != nil {
+		return err
 	}
-	_ = ctx
+	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state)); err != nil {
+		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
 	return nil
 }
 
@@ -464,6 +456,16 @@ func sortedPackages(m map[string]model.Package) []model.Package {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+func aptExpected(state model.RepositoryState) []download.Expected {
+	var expected []download.Expected
+	for _, pkg := range sortedPackages(state.Packages) {
+		expected = append(expected, download.Expected{
+			RelPath: pkg.Path, Size: pkg.Size, SHA256: pkg.SHA256,
+		})
+	}
+	return expected
 }
 
 func repoStaging(cfg *config.Config, kind, name string) string {

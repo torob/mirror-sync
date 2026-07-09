@@ -1,10 +1,10 @@
 # mirror-sync
 
 `mirrorsync` is a Go command-line tool for transparent mirroring of APT and
-Alpine APK repositories. It preserves upstream metadata and signatures, verifies
-package payloads against upstream checksums, and publishes package files before
-signed metadata so clients do not observe metadata that references missing
-packages.
+Alpine APK repositories. It preserves upstream metadata and signatures, publishes
+package files before signed metadata so clients do not observe metadata that
+references missing packages, and can repair local payload corruption from the
+currently published metadata.
 
 ## Usage
 

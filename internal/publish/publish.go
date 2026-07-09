@@ -45,7 +45,60 @@ func (l *Lock) Close() error {
 	return unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
 }
 
-func VerifyPublished(path string, size int64, shaHex string) (bool, error) {
+type VerifyOption interface {
+	Verify(path string, stat os.FileInfo) (bool, error)
+}
+
+type SizeCheck struct {
+	Size int64
+}
+
+func (c SizeCheck) Verify(_ string, stat os.FileInfo) (bool, error) {
+	return stat.Size() == c.Size, nil
+}
+
+type SHA256Check struct {
+	SHA256 string
+}
+
+func (c SHA256Check) Verify(path string, _ os.FileInfo) (bool, error) {
+	if c.SHA256 == "" {
+		return true, nil
+	}
+	got, err := sha256File(path)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(got, c.SHA256), nil
+}
+
+type FuncCheck struct {
+	Check func(path string) error
+}
+
+func (c FuncCheck) Verify(path string, _ os.FileInfo) (bool, error) {
+	if c.Check == nil {
+		return true, nil
+	}
+	if err := c.Check(path); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func WithSize(size int64) VerifyOption {
+	return SizeCheck{Size: size}
+}
+
+func WithSHA256(shaHex string) VerifyOption {
+	return SHA256Check{SHA256: shaHex}
+}
+
+func WithCheck(check func(path string) error) VerifyOption {
+	return FuncCheck{Check: check}
+}
+
+func Verify(path string, options ...VerifyOption) (bool, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -53,20 +106,22 @@ func VerifyPublished(path string, size int64, shaHex string) (bool, error) {
 		}
 		return false, err
 	}
-	if st.IsDir() || st.Size() != size {
+	if !st.Mode().IsRegular() {
 		return false, nil
 	}
-	if shaHex == "" {
-		return true, nil
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		ok, err := option.Verify(path, st)
+		if err != nil || !ok {
+			return ok, err
+		}
 	}
-	got, err := SHA256File(path)
-	if err != nil {
-		return false, err
-	}
-	return strings.EqualFold(got, shaHex), nil
+	return true, nil
 }
 
-func SHA256File(path string) (string, error) {
+func sha256File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -122,8 +177,9 @@ func AtomicWrite(root, stagingRoot, rel string, data []byte) error {
 
 func PublishMetadata(root, stagingRoot string, files []model.MetadataFile) error {
 	sort.SliceStable(files, func(i, j int) bool {
-		if files[i].SignedLast != files[j].SignedLast {
-			return !files[i].SignedLast
+		pi, pj := metadataPriority(files[i]), metadataPriority(files[j])
+		if pi != pj {
+			return pi < pj
 		}
 		return files[i].Path < files[j].Path
 	})
@@ -133,6 +189,16 @@ func PublishMetadata(root, stagingRoot string, files []model.MetadataFile) error
 		}
 	}
 	return nil
+}
+
+func metadataPriority(f model.MetadataFile) int {
+	if f.SignedLast {
+		return 2
+	}
+	if filepath.Base(filepath.FromSlash(f.Path)) == "Release" {
+		return 1
+	}
+	return 0
 }
 
 func Prune(root string, keep map[string]bool) ([]string, error) {

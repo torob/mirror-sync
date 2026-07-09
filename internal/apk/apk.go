@@ -63,18 +63,7 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var expected []download.Expected
-	for _, pkg := range sortedPackages(state.Packages) {
-		pkg := pkg
-		expected = append(expected, download.Expected{
-			RelPath: pkg.Path,
-			Size:    pkg.Size,
-			Verify: func(path string) error {
-				return verifyAPKPayload(path, pkg.APKHash)
-			},
-		})
-	}
-	if err := download.EnsureMany(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, expected); err != nil {
+	if err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state)); err != nil {
 		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
 	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), state.Metadata); err != nil {
@@ -88,27 +77,22 @@ func (r *Runner) Sync(ctx context.Context) error {
 }
 
 func (r *Runner) Verify(ctx context.Context) error {
+	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apk", r.Repo.Name)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	state, err := r.readPublishedState()
 	if err != nil {
 		return err
 	}
-	for _, pkg := range state.Packages {
-		final, err := safe.Join(r.Repo.AbsPublishPath, pkg.Path)
-		if err != nil {
-			return err
-		}
-		ok, err := publish.VerifyPublished(final, pkg.Size, "")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("apk %s package %s failed size verification", r.Repo.Name, pkg.Path)
-		}
-		if err := verifyAPKPayload(final, pkg.APKHash); err != nil {
-			return fmt.Errorf("apk %s package %s failed checksum verification: %w", r.Repo.Name, pkg.Path, err)
-		}
+	clients, err := r.payloadClients()
+	if err != nil {
+		return err
 	}
-	_ = ctx
+	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state)); err != nil {
+		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
+	}
 	return nil
 }
 
@@ -444,6 +428,21 @@ func sortedPackages(m map[string]model.Package) []model.Package {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+func apkExpected(state model.RepositoryState) []download.Expected {
+	var expected []download.Expected
+	for _, pkg := range sortedPackages(state.Packages) {
+		pkg := pkg
+		expected = append(expected, download.Expected{
+			RelPath: pkg.Path,
+			Size:    pkg.Size,
+			Verify: func(path string) error {
+				return verifyAPKPayload(path, pkg.APKHash)
+			},
+		})
+	}
+	return expected
 }
 
 func repoStaging(cfg *config.Config, kind, name string) string {

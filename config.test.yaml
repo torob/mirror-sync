@@ -13,17 +13,6 @@ sync:
 
 apt:
   repositories:
-    - name: docker-ubuntu
-      publish_path: docker-ubuntu
-      keyring: /etc/apt/keyrings/docker.asc
-      primary_source:
-        url: https://download.docker.com/linux/ubuntu
-      architectures:
-        - amd64
-      suites:
-        - name: noble
-          components:
-            - stable
     - name: ubuntu
       publish_path: ubuntu
       keyring: /usr/share/keyrings/ubuntu-archive-keyring.gpg

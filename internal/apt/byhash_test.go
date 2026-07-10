@@ -87,18 +87,18 @@ func TestDeriveByHashFilesUsesEveryAdvertisedAlgorithmAndLayout(t *testing.T) {
 	files := []model.RepositoryFile{
 		{
 			Path: "dists/noble/Contents-amd64.gz", Size: 7,
-			Checksums: map[string]string{
-				"MD5Sum": strings.Repeat("1", 32),
-				"SHA256": strings.Repeat("2", 64),
+			Checksums: model.Checksums{
+				MD5Sum: strings.Repeat("1", 32),
+				SHA256: strings.Repeat("2", 64),
 			},
 		},
 		{
 			Path: "dists/noble/main/binary-amd64/Packages.xz", Size: 9,
-			Checksums: map[string]string{
-				"MD5Sum": strings.Repeat("3", 32),
-				"SHA1":   strings.Repeat("4", 40),
-				"SHA256": strings.Repeat("5", 64),
-				"SHA512": strings.Repeat("6", 128),
+			Checksums: model.Checksums{
+				MD5Sum: strings.Repeat("3", 32),
+				SHA1:   strings.Repeat("4", 40),
+				SHA256: strings.Repeat("5", 64),
+				SHA512: strings.Repeat("6", 128),
 			},
 		},
 	}
@@ -127,7 +127,7 @@ func TestDeriveByHashFilesRejectsMalformedDigest(t *testing.T) {
 	for _, digest := range []string{"short", strings.Repeat("z", 64)} {
 		_, err := deriveByHashFiles([]model.RepositoryFile{{
 			Path: "dists/noble/main/binary-amd64/Packages", Size: 1,
-			Checksums: map[string]string{"SHA256": digest},
+			Checksums: model.Checksums{SHA256: digest},
 		}})
 		if err == nil {
 			t.Fatalf("deriveByHashFiles accepted digest %q", digest)
@@ -149,7 +149,7 @@ func TestDeriveByHashFilesCoversRepresentativeReleaseIndexes(t *testing.T) {
 	files := make([]model.RepositoryFile, 0, len(canonicalPaths))
 	for i, canonical := range canonicalPaths {
 		digest := fmt.Sprintf("%064x", i+1)
-		files = append(files, model.RepositoryFile{Path: canonical, Size: int64(i), Checksums: map[string]string{"SHA256": digest}})
+		files = append(files, model.RepositoryFile{Path: canonical, Size: int64(i), Checksums: model.Checksums{SHA256: digest}})
 	}
 	derived, err := deriveByHashFiles(files)
 	if err != nil {
@@ -216,7 +216,7 @@ func TestPruneWithCorruptHistoryPreservesUnknownByHash(t *testing.T) {
 	if err := os.WriteFile(manifest, []byte("{"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := runner.pruneState(model.RepositoryState{Packages: map[string]model.Package{}})
+	removed, err := runner.pruneState(model.RepositoryState{Packages: map[string]model.Payload{}})
 	if err != nil {
 		t.Fatal(err)
 	}

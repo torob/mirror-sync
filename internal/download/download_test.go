@@ -22,6 +22,7 @@ import (
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/httpx"
 	"github.com/torob/mirror-sync/internal/limit"
+	"github.com/torob/mirror-sync/internal/model"
 )
 
 func TestEnsureManyDownloadsConcurrentlyWithinGlobalLimit(t *testing.T) {
@@ -694,6 +695,48 @@ func TestEnsureRepairedReportsStagedRepairWithoutDownload(t *testing.T) {
 	}
 	if stats.FilesChecked != 1 || stats.FilesRepaired != 1 || stats.FilesDownloaded != 0 || stats.BytesDownloaded != 0 {
 		t.Fatalf("stats = %+v, want one staged repair without download", stats)
+	}
+}
+
+func TestEnsureSyncedPayloadsUsesCompactPayloadMap(t *testing.T) {
+	body := []byte("package")
+	sum := sha256.Sum256(body)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	payloads := map[string]model.Payload{
+		"pool/package.deb": {Size: int64(len(body)), Checksums: model.Checksums{SHA256: hex.EncodeToString(sum[:])}},
+	}
+	root, staging := t.TempDir(), t.TempDir()
+	stats, err := EnsureSyncedPayloads(context.Background(), root, staging, []*httpx.Client{testClient(t, server.URL, 1, 1)}, payloads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesDownloaded != 1 {
+		t.Fatalf("stats = %+v", stats)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "pool", "package.deb")); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("published payload = %q, error = %v", got, err)
+	}
+}
+
+func BenchmarkPayloadExpectedIteration(b *testing.B) {
+	payloads := make(map[string]model.Payload, 100_000)
+	for i := 0; i < 100_000; i++ {
+		payloads[fmt.Sprintf("pool/package-%d.deb", i)] = model.Payload{Size: int64(i), Checksums: model.Checksums{SHA256: strings.Repeat("a", 64)}}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		count := 0
+		payloadExpected(payloads)(func(Expected) bool {
+			count++
+			return true
+		})
+		if count != len(payloads) {
+			b.Fatalf("iterated %d payloads, want %d", count, len(payloads))
+		}
 	}
 }
 

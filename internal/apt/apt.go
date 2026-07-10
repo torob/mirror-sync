@@ -1,17 +1,15 @@
 package apt
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -43,7 +41,7 @@ type Runner struct {
 type releaseFile struct {
 	Size      int64
 	SizeSet   bool
-	Checksums map[string]string
+	Checksums model.Checksums
 }
 
 func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
@@ -100,7 +98,7 @@ func (r *Runner) Sync(ctx context.Context) (model.OperationStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	packageStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
+	packageStats, err := download.EnsureSyncedPayloads(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, state.Packages)
 	stats.Add(packageStats)
 	if err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
@@ -162,7 +160,7 @@ func (r *Runner) Verify(ctx context.Context) (model.OperationStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	packageStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
+	packageStats, err := download.EnsureRepairedPayloads(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, state.Packages)
 	stats.Add(packageStats)
 	if err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
@@ -246,7 +244,7 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Package{}}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Payload{}}
 	for _, suite := range r.Repo.Suites {
 		releaseText, releaseHashes, metadata, err := r.fetchRelease(ctx, client, keyring, suite.Name)
 		if err != nil {
@@ -282,56 +280,51 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 		}
 		for _, component := range suite.Components {
 			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
-				indexRel, indexData, found, err := r.readResolvedPackagesIndex(suite.Name, component, arch, releaseHashes, files)
+				indexRel, indexFile, found, err := r.openResolvedPackagesIndex(suite.Name, component, arch, releaseHashes, files)
 				if err != nil {
 					return out, err
 				}
 				if !found {
 					continue
 				}
-				indexPlain, err := decompressIndex(indexRel, indexData)
-				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
+				err = consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parsePackages(reader, allowedPackageArchitectures(r.Repo.Architectures), func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, fmt.Errorf("apt %s parse %s: %w", r.Repo.Name, indexRel, err)
-				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
 				}
 			}
 			for _, arch := range selectedArchitectureNames(r.Repo.Architectures) {
-				indexRel, indexData, found, err := r.readResolvedInstallerIndex(suite.Name, component, arch, releaseHashes, files)
+				indexRel, indexFile, found, err := r.openResolvedInstallerIndex(suite.Name, component, arch, releaseHashes, files)
 				if err != nil {
 					return out, err
 				}
 				if !found {
 					continue
 				}
-				indexPlain, err := decompressIndex(indexRel, indexData)
-				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
+				err = consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parsePackages(reader, allowedPackageArchitectures(r.Repo.Architectures), func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, fmt.Errorf("apt %s parse %s: %w", r.Repo.Name, indexRel, err)
 				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
-				}
 			}
-			indexRel, indexData, found, err := r.readResolvedSourcesIndex(suite.Name, component, releaseHashes, files)
+			indexRel, indexFile, found, err := r.openResolvedSourcesIndex(suite.Name, component, releaseHashes, files)
 			if err != nil {
 				return out, err
 			}
 			if found {
-				pkgs, err := parseSources(decompressIndex(indexRel, indexData))
+				err := consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parseSources(reader, func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, fmt.Errorf("apt %s parse %s: %w", r.Repo.Name, indexRel, err)
-				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
 				}
 			}
 		}
@@ -499,26 +492,30 @@ func verifiedReleaseMetadata(cleartext []byte, metadata []model.MetadataFile) (*
 func repositoryFilesFromExpected(expected []download.Expected) []model.RepositoryFile {
 	files := make([]model.RepositoryFile, 0, len(expected))
 	for _, exp := range expected {
+		checksums := exp.Checksums
+		if checksums.Empty() && exp.SHA256 != "" {
+			checksums.SHA256 = exp.SHA256
+		}
 		files = append(files, model.RepositoryFile{
-			Path: exp.RelPath, Size: exp.Size, SHA256: exp.SHA256, Checksums: cloneChecksums(exp.Checksums),
+			Path: exp.RelPath, Size: exp.Size, Checksums: checksums,
 		})
 	}
 	return files
 }
 
-func (r *Runner) readResolvedPackagesIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
-	return r.readResolvedNamedIndex(suite, path.Join(component, "binary-"+arch), "Packages", hashes, files)
+func (r *Runner) openResolvedPackagesIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, *os.File, bool, error) {
+	return r.openResolvedNamedIndex(suite, path.Join(component, "binary-"+arch), "Packages", hashes, files)
 }
 
-func (r *Runner) readResolvedInstallerIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
-	return r.readResolvedNamedIndex(suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes, files)
+func (r *Runner) openResolvedInstallerIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, *os.File, bool, error) {
+	return r.openResolvedNamedIndex(suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes, files)
 }
 
-func (r *Runner) readResolvedSourcesIndex(suite, component string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
-	return r.readResolvedNamedIndex(suite, path.Join(component, "source"), "Sources", hashes, files)
+func (r *Runner) openResolvedSourcesIndex(suite, component string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, *os.File, bool, error) {
+	return r.openResolvedNamedIndex(suite, path.Join(component, "source"), "Sources", hashes, files)
 }
 
-func (r *Runner) readResolvedNamedIndex(suite, dir, name string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
+func (r *Runner) openResolvedNamedIndex(suite, dir, name string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, *os.File, bool, error) {
 	resolved := map[string]bool{}
 	for _, file := range files {
 		resolved[file.Path] = true
@@ -529,18 +526,18 @@ func (r *Runner) readResolvedNamedIndex(suite, dir, name string, hashes map[stri
 			continue
 		}
 		staged := filepathFor(path.Join(repoStaging(r.Config, "apt", r.Repo.Name), "payloads"), fullRel)
-		data, err := os.ReadFile(staged)
+		file, err := os.Open(staged)
 		if err == nil {
-			return rel, data, true, nil
+			return rel, file, true, nil
 		}
 		if !os.IsNotExist(err) {
 			return "", nil, false, err
 		}
-		data, err = os.ReadFile(filepathFor(r.Repo.AbsPublishPath, fullRel))
+		file, err = os.Open(filepathFor(r.Repo.AbsPublishPath, fullRel))
 		if err != nil {
 			return "", nil, false, err
 		}
-		return rel, data, true, nil
+		return rel, file, true, nil
 	}
 	return "", nil, false, nil
 }
@@ -571,7 +568,7 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 		hashes := hashesBySuite[suite.Name]
 		for _, component := range suite.Components {
 			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
-				indexRel, data, found, err := r.readPublishedIndex(suite.Name, component, arch, hashes)
+				indexRel, indexFile, found, err := r.openPublishedIndex(suite.Name, component, arch, hashes)
 				if err != nil {
 					return out, err
 				}
@@ -581,19 +578,17 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 					}
 					return out, fmt.Errorf("no valid published Packages index for %s/%s/%s", suite.Name, component, arch)
 				}
-				indexPlain, err := decompressIndex(indexRel, data)
-				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
+				err = consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parsePackages(reader, allowedPackageArchitectures(r.Repo.Architectures), func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, err
 				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
-				}
 			}
 			for _, arch := range selectedArchitectureNames(r.Repo.Architectures) {
-				indexRel, data, found, err := r.readPublishedInstallerIndex(suite.Name, component, arch, hashes)
+				indexRel, indexFile, found, err := r.openPublishedInstallerIndex(suite.Name, component, arch, hashes)
 				if err != nil {
 					return out, err
 				}
@@ -603,30 +598,27 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 					}
 					continue
 				}
-				indexPlain, err := decompressIndex(indexRel, data)
-				pkgs, err := parsePackages(indexPlain, err, allowedPackageArchitectures(r.Repo.Architectures))
+				err = consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parsePackages(reader, allowedPackageArchitectures(r.Repo.Architectures), func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, err
 				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
-				}
 			}
-			indexRel, data, found, err := r.readPublishedSourcesIndex(suite.Name, component, hashes)
+			indexRel, indexFile, found, err := r.openPublishedSourcesIndex(suite.Name, component, hashes)
 			if err != nil {
 				return out, err
 			}
 			if found {
-				pkgs, err := parseSources(decompressIndex(indexRel, data))
+				err := consumeIndex(indexRel, indexFile, func(reader io.Reader) error {
+					return parseSources(reader, func(pkg model.Package) error {
+						return addPayload(out.Packages, pkg, indexRel)
+					})
+				})
 				if err != nil {
 					return out, err
-				}
-				for _, pkg := range pkgs {
-					if err := addPayload(out.Packages, pkg, indexRel); err != nil {
-						return out, err
-					}
 				}
 			} else if releaseAdvertisesIndex(path.Join(component, "source"), "Sources", hashes) {
 				return out, fmt.Errorf("no valid published Sources index for %s/%s", suite.Name, component)
@@ -641,7 +633,7 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Package{}}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Payload{}}
 	resolvedState, resolvedStatus, err := r.loadResolvedReleaseState()
 	if err != nil {
 		return out, err
@@ -722,35 +714,40 @@ func readOptionalPublished(root, rel string) ([]byte, bool, error) {
 	return nil, false, err
 }
 
-func (r *Runner) readPublishedIndex(suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.readPublishedNamedIndex(suite, path.Join(component, "binary-"+arch), "Packages", hashes)
+func (r *Runner) openPublishedIndex(suite, component, arch string, hashes map[string]releaseFile) (string, *os.File, bool, error) {
+	return r.openPublishedNamedIndex(suite, path.Join(component, "binary-"+arch), "Packages", hashes)
 }
 
-func (r *Runner) readPublishedInstallerIndex(suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.readPublishedNamedIndex(suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes)
+func (r *Runner) openPublishedInstallerIndex(suite, component, arch string, hashes map[string]releaseFile) (string, *os.File, bool, error) {
+	return r.openPublishedNamedIndex(suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes)
 }
 
-func (r *Runner) readPublishedSourcesIndex(suite, component string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.readPublishedNamedIndex(suite, path.Join(component, "source"), "Sources", hashes)
+func (r *Runner) openPublishedSourcesIndex(suite, component string, hashes map[string]releaseFile) (string, *os.File, bool, error) {
+	return r.openPublishedNamedIndex(suite, path.Join(component, "source"), "Sources", hashes)
 }
 
-func (r *Runner) readPublishedNamedIndex(suite, dir, name string, hashes map[string]releaseFile) (string, []byte, bool, error) {
+func (r *Runner) openPublishedNamedIndex(suite, dir, name string, hashes map[string]releaseFile) (string, *os.File, bool, error) {
 	for _, rel := range indexCandidates(dir, name) {
 		want, ok := hashes[rel]
 		if !ok {
 			continue
 		}
-		data, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, path.Join("dists", suite, rel)))
+		filePath := filepathFor(r.Repo.AbsPublishPath, path.Join("dists", suite, rel))
+		ok, err := verifyFile(filePath, want)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return "", nil, false, err
 		}
-		if err := verifyBytes(data, want); err != nil {
+		if !ok {
 			continue
 		}
-		return rel, data, true, nil
+		file, err := os.Open(filePath)
+		if err != nil {
+			return "", nil, false, err
+		}
+		return rel, file, true, nil
 	}
 	return "", nil, false, nil
 }
@@ -907,18 +904,15 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 				return nil, fmt.Errorf("%s has negative size in Release", fields[2])
 			}
 			existing := out[fields[2]]
-			if existing.Checksums == nil {
-				existing.Checksums = map[string]string{}
-			}
 			if existing.SizeSet && existing.Size != size {
 				return nil, fmt.Errorf("%s has conflicting sizes in Release", fields[2])
 			}
-			if got := existing.Checksums[checksumType]; got != "" && !strings.EqualFold(got, fields[0]) {
+			if got := existing.Checksums.Get(checksumType); got != "" && !strings.EqualFold(got, fields[0]) {
 				return nil, fmt.Errorf("%s has conflicting %s hashes in Release", fields[2], checksumType)
 			}
 			existing.Size = size
 			existing.SizeSet = true
-			existing.Checksums[checksumType] = fields[0]
+			existing.Checksums.Set(checksumType, fields[0])
 			out[fields[2]] = existing
 		}
 	}
@@ -964,7 +958,7 @@ func selectReleaseFiles(suite config.APTSuite, architectures []string, hashes ma
 			return nil, err
 		}
 		file := hashes[rel]
-		out = append(out, model.RepositoryFile{Path: publishedRel, Size: file.Size, Checksums: cloneChecksums(file.Checksums)})
+		out = append(out, model.RepositoryFile{Path: publishedRel, Size: file.Size, Checksums: file.Checksums})
 	}
 	return out, nil
 }
@@ -1110,72 +1104,131 @@ func trimIndexCompression(name string) string {
 	return name
 }
 
-func decompressIndex(rel string, data []byte) ([]byte, error) {
+func consumeIndex(rel string, file *os.File, consume func(io.Reader) error) (err error) {
+	if file == nil {
+		return fmt.Errorf("nil index file")
+	}
+	defer func() { err = errors.Join(err, file.Close()) }()
+	var reader io.Reader = file
+	var closer io.Closer
 	switch {
 	case strings.HasSuffix(rel, ".gz"):
-		zr, err := gzip.NewReader(bytes.NewReader(data))
+		zr, err := gzip.NewReader(file)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		defer zr.Close()
-		return io.ReadAll(zr)
+		reader, closer = zr, zr
 	case strings.HasSuffix(rel, ".xz"):
-		xzr, err := xz.NewReader(bytes.NewReader(data))
+		xzr, err := xz.NewReader(file)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return io.ReadAll(xzr)
+		reader = xzr
 	case strings.HasSuffix(rel, ".bz2"):
-		return io.ReadAll(bzip2.NewReader(bytes.NewReader(data)))
-	default:
-		return data, nil
+		reader = bzip2.NewReader(file)
 	}
+	err = consume(reader)
+	if closer != nil {
+		err = errors.Join(err, closer.Close())
+	}
+	return err
 }
 
-func parsePackages(data []byte, err error, allowedArchs map[string]bool) ([]model.Package, error) {
-	if err != nil {
-		return nil, err
+func parsePackages(reader io.Reader, allowedArchs map[string]bool, yield func(model.Package) error) error {
+	type packageFields struct {
+		filename     string
+		architecture string
+		size         string
+		checksums    model.Checksums
 	}
-	var out []model.Package
-	for _, para := range strings.Split(string(data), "\n\n") {
-		fields := parseParagraph(para)
-		if fields["Filename"] == "" {
-			continue
+	var fields packageFields
+	finish := func() error {
+		defer func() { fields = packageFields{} }()
+		if fields.filename == "" {
+			return nil
 		}
-		if arch := fields["Architecture"]; len(allowedArchs) > 0 && !allowedArchs[arch] {
-			continue
+		if len(allowedArchs) > 0 && !allowedArchs[fields.architecture] {
+			return nil
 		}
-		size, err := strconv.ParseInt(fields["Size"], 10, 64)
+		size, err := strconv.ParseInt(fields.size, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("%s Size: %w", fields["Filename"], err)
+			return fmt.Errorf("%s Size: %w", fields.filename, err)
 		}
-		rel, err := safe.Rel(fields["Filename"])
+		rel, err := safe.Rel(fields.filename)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		checksums := paragraphChecksums(fields)
-		if len(checksums) == 0 {
-			return nil, fmt.Errorf("%s has no supported checksum", fields["Filename"])
+		if fields.checksums.Empty() {
+			return fmt.Errorf("%s has no supported checksum", fields.filename)
 		}
-		out = append(out, model.Package{Path: rel, Size: size, SHA256: checksums["SHA256"], Checksums: checksums})
+		return yield(model.Package{Path: rel, Size: size, Checksums: fields.checksums})
 	}
-	return out, nil
+	return scanControl(reader, func(line string) error {
+		if line[0] == ' ' || line[0] == '\t' {
+			return nil
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil
+		}
+		value = strings.Clone(strings.TrimSpace(value))
+		switch name {
+		case "Filename":
+			fields.filename = value
+		case "Architecture":
+			fields.architecture = value
+		case "Size":
+			fields.size = value
+		case "MD5sum", "MD5Sum", "SHA1", "SHA256", "SHA512":
+			fields.checksums.Set(name, value)
+		}
+		return nil
+	}, finish)
 }
 
-func parseSources(data []byte, err error) ([]model.Package, error) {
-	if err != nil {
-		return nil, err
-	}
-	var out []model.Package
-	for _, para := range strings.Split(string(data), "\n\n") {
-		fields := parseParagraph(para)
-		dir := fields["Directory"]
-		if dir == "" {
-			continue
+type sourcePayload struct {
+	Size      int64
+	SizeSet   bool
+	Checksums model.Checksums
+}
+
+func parseSources(reader io.Reader, yield func(model.Package) error) error {
+	var directory string
+	var checksumName string
+	files := map[string]sourcePayload{}
+	addEntry := func(line string) error {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return nil
 		}
-		files, err := sourcePayloads(fields)
+		parts := strings.Fields(line)
+		if len(parts) != 3 {
+			return fmt.Errorf("%s: invalid source file entry %q", directory, line)
+		}
+		size, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("%s/%s Size: %w", directory, parts[2], err)
+		}
+		payload := files[parts[2]]
+		if payload.SizeSet && payload.Size != size {
+			return fmt.Errorf("%s/%s has conflicting sizes", directory, parts[2])
+		}
+		if got := payload.Checksums.Get(checksumName); got != "" && !strings.EqualFold(got, parts[0]) {
+			return fmt.Errorf("%s/%s has conflicting %s hashes", directory, parts[2], checksumName)
+		}
+		payload.Size, payload.SizeSet = size, true
+		payload.Checksums.Set(checksumName, strings.Clone(parts[0]))
+		files[strings.Clone(parts[2])] = payload
+		return nil
+	}
+	finish := func() error {
+		defer func() {
+			directory = ""
+			checksumName = ""
+			files = map[string]sourcePayload{}
+		}()
+		if directory == "" {
+			return nil
 		}
 		names := make([]string, 0, len(files))
 		for name := range files {
@@ -1184,72 +1237,43 @@ func parseSources(data []byte, err error) ([]model.Package, error) {
 		sort.Strings(names)
 		for _, name := range names {
 			info := files[name]
-			rel, err := safe.Rel(path.Join(dir, name))
-			if err != nil {
-				return nil, err
+			if info.Checksums.Empty() {
+				return fmt.Errorf("%s/%s has no supported checksum", directory, name)
 			}
-			out = append(out, model.Package{Path: rel, Size: info.Size, SHA256: info.Checksums["SHA256"], Checksums: cloneChecksums(info.Checksums)})
+			rel, err := safe.Rel(path.Join(directory, name))
+			if err != nil {
+				return err
+			}
+			if err := yield(model.Package{Path: rel, Size: info.Size, Checksums: info.Checksums}); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	return out, nil
-}
-
-func paragraphChecksums(fields map[string]string) map[string]string {
-	out := map[string]string{}
-	for _, key := range []string{"MD5sum", "MD5Sum", "SHA1", "SHA256", "SHA512"} {
-		if fields[key] != "" {
-			out[canonicalChecksumName(key)] = fields[key]
+	return scanControl(reader, func(line string) error {
+		if line[0] == ' ' || line[0] == '\t' {
+			if checksumName != "" {
+				return addEntry(line)
+			}
+			return nil
 		}
-	}
-	return out
-}
-
-type sourcePayload struct {
-	Size      int64
-	Checksums map[string]string
-}
-
-func sourcePayloads(fields map[string]string) (map[string]sourcePayload, error) {
-	out := map[string]sourcePayload{}
-	for field, value := range fields {
-		checksumName, ok := sourceChecksumField(field)
+		name, value, ok := strings.Cut(line, ":")
 		if !ok {
-			continue
+			checksumName = ""
+			return nil
 		}
-		for _, line := range strings.Split(value, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.Fields(line)
-			if len(parts) != 3 {
-				return nil, fmt.Errorf("%s: invalid source file entry %q", fields["Directory"], line)
-			}
-			size, err := strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("%s/%s Size: %w", fields["Directory"], parts[2], err)
-			}
-			payload := out[parts[2]]
-			if payload.Checksums == nil {
-				payload.Checksums = map[string]string{}
-			}
-			if payload.Size != 0 && payload.Size != size {
-				return nil, fmt.Errorf("%s/%s has conflicting sizes", fields["Directory"], parts[2])
-			}
-			if got := payload.Checksums[checksumName]; got != "" && !strings.EqualFold(got, parts[0]) {
-				return nil, fmt.Errorf("%s/%s has conflicting %s hashes", fields["Directory"], parts[2], checksumName)
-			}
-			payload.Size = size
-			payload.Checksums[checksumName] = parts[0]
-			out[parts[2]] = payload
+		if name == "Directory" {
+			directory = strings.Clone(strings.TrimSpace(value))
+			checksumName = ""
+			return nil
 		}
-	}
-	for name, payload := range out {
-		if len(payload.Checksums) == 0 {
-			return nil, fmt.Errorf("%s/%s has no supported checksum", fields["Directory"], name)
+		checksumName, ok = sourceChecksumField(name)
+		if ok {
+			return addEntry(value)
 		}
-	}
-	return out, nil
+		checksumName = ""
+		return nil
+	}, finish)
 }
 
 func sourceChecksumField(field string) (string, bool) {
@@ -1267,47 +1291,55 @@ func sourceChecksumField(field string) (string, bool) {
 	}
 }
 
-func parseParagraph(text string) map[string]string {
-	out := map[string]string{}
-	var last string
-	for _, line := range strings.Split(text, "\n") {
-		if line == "" {
-			continue
-		}
-		if line[0] == ' ' || line[0] == '\t' {
-			if last != "" {
-				out[last] += "\n" + line
+func scanControl(reader io.Reader, line func(string) error, finish func() error) error {
+	buffered := bufio.NewReaderSize(reader, 64*1024)
+	haveFields := false
+	for {
+		raw, err := buffered.ReadString('\n')
+		if len(raw) > 0 {
+			raw = strings.TrimSuffix(raw, "\n")
+			raw = strings.TrimSuffix(raw, "\r")
+			if raw == "" {
+				if haveFields {
+					if finishErr := finish(); finishErr != nil {
+						return finishErr
+					}
+					haveFields = false
+				}
+			} else {
+				haveFields = true
+				if lineErr := line(raw); lineErr != nil {
+					return lineErr
+				}
 			}
-			continue
 		}
-		k, v, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			if haveFields {
+				return finish()
+			}
+			return nil
 		}
-		last = k
-		out[k] = strings.TrimSpace(v)
 	}
-	return out
 }
 
-func addPayload(payloads map[string]model.Package, pkg model.Package, source string) error {
+func addPayload(payloads map[string]model.Payload, pkg model.Package, source string) error {
 	if existing, ok := payloads[pkg.Path]; ok {
 		if existing.Size != pkg.Size || !sameChecksums(existing.Checksums, pkg.Checksums) {
 			return fmt.Errorf("%s: conflicting metadata for payload %s", source, pkg.Path)
 		}
 		existing.Checksums = mergeChecksums(existing.Checksums, pkg.Checksums)
-		if existing.SHA256 == "" {
-			existing.SHA256 = pkg.SHA256
-		}
 		payloads[pkg.Path] = existing
 		return nil
 	}
-	payloads[pkg.Path] = pkg
+	payloads[pkg.Path] = model.Payload{Size: pkg.Size, Checksums: pkg.Checksums}
 	return nil
 }
 
-func sameChecksums(a, b map[string]string) bool {
-	if len(a) == 0 && len(b) == 0 {
+func sameChecksums(a, b model.Checksums) bool {
+	if a.Empty() && b.Empty() {
 		return true
 	}
 	for _, alg := range []string{"SHA512", "SHA256", "SHA1", "MD5Sum", "MD5"} {
@@ -1320,26 +1352,12 @@ func sameChecksums(a, b map[string]string) bool {
 	return true
 }
 
-func verifyBytes(data []byte, want releaseFile) error {
-	if int64(len(data)) != want.Size {
-		return fmt.Errorf("size mismatch got %d want %d", len(data), want.Size)
-	}
+func verifyFile(file string, want releaseFile) (bool, error) {
 	alg, hexWant := strongestReleaseChecksum(want)
 	if alg == "" {
-		return fmt.Errorf("no supported checksum")
+		return false, fmt.Errorf("no supported checksum")
 	}
-	h, err := newHash(alg)
-	if err != nil {
-		return err
-	}
-	if _, err := h.Write(data); err != nil {
-		return err
-	}
-	got := hex.EncodeToString(h.Sum(nil))
-	if !strings.EqualFold(got, hexWant) {
-		return fmt.Errorf("%s mismatch got %s want %s", strings.ToLower(alg), got, hexWant)
-	}
-	return nil
+	return publish.Verify(file, publish.WithSize(want.Size), publish.WithChecksum(alg, hexWant))
 }
 
 func strongestReleaseChecksum(file releaseFile) (string, string) {
@@ -1351,13 +1369,8 @@ func strongestReleaseChecksum(file releaseFile) (string, string) {
 	return "", ""
 }
 
-func checksumFromMap(checksums map[string]string, algorithm string) string {
-	for name, value := range checksums {
-		if strings.EqualFold(canonicalChecksumName(name), canonicalChecksumName(algorithm)) {
-			return value
-		}
-	}
-	return ""
+func checksumFromMap(checksums model.Checksums, algorithm string) string {
+	return checksums.Get(algorithm)
 }
 
 func canonicalChecksumName(name string) string {
@@ -1367,41 +1380,14 @@ func canonicalChecksumName(name string) string {
 	return strings.ToUpper(name)
 }
 
-func cloneChecksums(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for name, value := range in {
-		out[canonicalChecksumName(name)] = value
-	}
-	return out
-}
-
-func mergeChecksums(a, b map[string]string) map[string]string {
-	out := cloneChecksums(a)
-	if out == nil {
-		out = map[string]string{}
-	}
-	for name, value := range b {
-		out[canonicalChecksumName(name)] = value
+func mergeChecksums(a, b model.Checksums) model.Checksums {
+	out := a
+	for _, name := range []string{"MD5Sum", "SHA1", "SHA256", "SHA512"} {
+		if value := b.Get(name); value != "" {
+			out.Set(name, value)
+		}
 	}
 	return out
-}
-
-func newHash(algorithm string) (hash.Hash, error) {
-	switch canonicalChecksumName(algorithm) {
-	case "MD5Sum":
-		return md5.New(), nil
-	case "SHA1":
-		return sha1.New(), nil
-	case "SHA256":
-		return sha256.New(), nil
-	case "SHA512":
-		return sha512.New(), nil
-	default:
-		return nil, fmt.Errorf("unsupported checksum algorithm %q", algorithm)
-	}
 }
 
 func (r *Runner) payloadClients() ([]*httpx.Client, error) {
@@ -1436,25 +1422,6 @@ func (r *Runner) sourceDescriptions() []string {
 	return out
 }
 
-func sortedPackages(m map[string]model.Package) []model.Package {
-	out := make([]model.Package, 0, len(m))
-	for _, pkg := range m {
-		out = append(out, pkg)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out
-}
-
-func aptPackageExpected(packages map[string]model.Package) []download.Expected {
-	var expected []download.Expected
-	for _, pkg := range sortedPackages(packages) {
-		expected = append(expected, download.Expected{
-			RelPath: pkg.Path, Size: pkg.Size, SHA256: pkg.SHA256, Checksums: cloneChecksums(pkg.Checksums),
-		})
-	}
-	return expected
-}
-
 func aptFileExpected(files []model.RepositoryFile) []download.Expected {
 	files = sortedFiles(files)
 	expected := make([]download.Expected, 0, len(files))
@@ -1462,8 +1429,7 @@ func aptFileExpected(files []model.RepositoryFile) []download.Expected {
 		expected = append(expected, download.Expected{
 			RelPath:      f.Path,
 			Size:         f.Size,
-			SHA256:       f.SHA256,
-			Checksums:    cloneChecksums(f.Checksums),
+			Checksums:    f.Checksums,
 			VerifyOnSync: true,
 		})
 	}

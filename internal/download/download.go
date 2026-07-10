@@ -35,7 +35,7 @@ type Expected struct {
 	RelPath      string
 	Size         int64
 	SHA256       string
-	Checksums    map[string]string
+	Checksums    model.Checksums
 	Verify       func(path string) error
 	VerifyOnSync bool
 	Sources      []Source
@@ -141,15 +141,45 @@ func resolveExactOne(ctx context.Context, publishRoot, stagingRoot string, reuse
 }
 
 func EnsureSynced(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) (model.OperationStats, error) {
-	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureSyncedOne)
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, len(expected), sliceExpected(expected), ensureSyncedOne)
 }
 
 func EnsureRepaired(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) (model.OperationStats, error) {
-	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureRepairedOne)
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, len(expected), sliceExpected(expected), ensureRepairedOne)
 }
 
-func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected, ensureOne ensureOneFunc) (model.OperationStats, error) {
-	workers := workerCount(clients, len(expected))
+func EnsureSyncedPayloads(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, payloads map[string]model.Payload) (model.OperationStats, error) {
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, len(payloads), payloadExpected(payloads), ensureSyncedOne)
+}
+
+func EnsureRepairedPayloads(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, payloads map[string]model.Payload) (model.OperationStats, error) {
+	return ensureMany(ctx, publishRoot, stagingRoot, clients, len(payloads), payloadExpected(payloads), ensureRepairedOne)
+}
+
+type expectedIterator func(func(Expected) bool)
+
+func sliceExpected(expected []Expected) expectedIterator {
+	return func(yield func(Expected) bool) {
+		for _, exp := range expected {
+			if !yield(exp) {
+				return
+			}
+		}
+	}
+}
+
+func payloadExpected(payloads map[string]model.Payload) expectedIterator {
+	return func(yield func(Expected) bool) {
+		for rel, payload := range payloads {
+			if !yield(Expected{RelPath: rel, Size: payload.Size, Checksums: payload.Checksums, Verify: payload.Verify}) {
+				return
+			}
+		}
+	}
+}
+
+func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expectedCount int, expected expectedIterator, ensureOne ensureOneFunc) (model.OperationStats, error) {
+	workers := workerCount(clients, expectedCount)
 	if workers == 0 {
 		return model.OperationStats{}, nil
 	}
@@ -173,15 +203,14 @@ func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []
 		})
 	}
 
-	for _, exp := range expected {
+	expected(func(exp Expected) bool {
 		select {
 		case jobs <- exp:
+			return true
 		case <-ctx.Done():
-			close(jobs)
-			err := g.Wait()
-			return stats, err
+			return false
 		}
-	}
+	})
 	close(jobs)
 	err := g.Wait()
 	return stats, err
@@ -398,14 +427,12 @@ func checksumVerifyOption(expected Expected) publish.VerifyOption {
 
 func strongestChecksum(expected Expected) (string, string) {
 	checksums := expected.Checksums
-	if len(checksums) == 0 && expected.SHA256 != "" {
-		checksums = map[string]string{"SHA256": expected.SHA256}
+	if checksums.Empty() && expected.SHA256 != "" {
+		checksums.SHA256 = expected.SHA256
 	}
 	for _, alg := range []string{"SHA512", "SHA256", "SHA1", "MD5Sum", "MD5"} {
-		for name, value := range checksums {
-			if strings.EqualFold(name, alg) && value != "" {
-				return canonicalChecksumName(name), value
-			}
+		if value := checksums.Get(alg); value != "" {
+			return canonicalChecksumName(alg), value
 		}
 	}
 	return "", ""

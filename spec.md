@@ -519,10 +519,12 @@ Requirements:
   directories created or touched during publishing must have mode `0755`.
   These modes are exact and must not depend on the process umask. Existing
   payloads reused during sync are not mode-repaired by normal sync.
-- Metadata files and package indexes may be buffered in memory when their
-  expected size is small enough for normal repository metadata processing, but
-  package payload memory usage must remain bounded by buffer size and
-  the number of concurrently streamed payloads.
+- Signed metadata files may be buffered in memory when their expected size is
+  small enough for normal repository metadata processing. APT Packages and
+  Sources indexes and the APKINDEX member must be decompressed and parsed
+  incrementally; their complete decompressed contents must not be retained in
+  memory. Package payload verification memory usage must remain bounded by
+  buffer size and the number of concurrently streamed payloads.
 
 ## In-Flight Request Limits
 

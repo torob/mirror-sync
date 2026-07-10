@@ -505,7 +505,7 @@ SHA512:
 	if got.Size != 12 {
 		t.Fatalf("size = %d, want 12", got.Size)
 	}
-	if got.Checksums["MD5Sum"] == "" || got.Checksums["SHA256"] == "" || got.Checksums["SHA512"] == "" {
+	if got.Checksums.MD5Sum == "" || got.Checksums.SHA256 == "" || got.Checksums.SHA512 == "" {
 		t.Fatalf("checksums = %#v, want md5/sha256/sha512", got.Checksums)
 	}
 }
@@ -852,7 +852,7 @@ func TestPruneStateRemovesStaleAlternateMetadata(t *testing.T) {
 	}
 	runner := &Runner{Repo: config.APTRepository{AbsPublishPath: root}}
 	removed, err := runner.pruneState(model.RepositoryState{
-		Packages: map[string]model.Package{},
+		Packages: map[string]model.Payload{},
 		Metadata: []model.MetadataFile{{Path: "dists/stable/Release"}},
 	})
 	if err != nil {
@@ -867,7 +867,8 @@ func TestPruneStateRemovesStaleAlternateMetadata(t *testing.T) {
 }
 
 func TestParsePackagesFiltersArchitecturesAndCarriesChecksums(t *testing.T) {
-	pkgs, err := parsePackages([]byte(`Package: native
+	var pkgs []model.Package
+	err := parsePackages(strings.NewReader(`Package: native
 Architecture: amd64
 Filename: pool/main/n/native/native_1_amd64.deb
 Size: 10
@@ -884,7 +885,10 @@ Architecture: arm64
 Filename: pool/main/f/foreign/foreign_1_arm64.deb
 Size: 12
 SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-`), nil, map[string]bool{"amd64": true, "all": true})
+`), map[string]bool{"amd64": true, "all": true}, func(pkg model.Package) error {
+		pkgs = append(pkgs, pkg)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -896,13 +900,14 @@ SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("packages = %#v, want %#v", got, want)
 	}
-	if pkgs[1].Checksums["SHA512"] == "" {
+	if pkgs[1].Checksums.SHA512 == "" {
 		t.Fatalf("checksums = %#v, want SHA512 on arch-all package", pkgs[1].Checksums)
 	}
 }
 
 func TestParseSourcesExpandsSourcePayloads(t *testing.T) {
-	pkgs, err := parseSources([]byte(`Package: hello
+	var pkgs []model.Package
+	err := parseSources(strings.NewReader(`Package: hello
 Directory: pool/main/h/hello
 Files:
  11111111111111111111111111111111 5 hello_1.dsc
@@ -910,7 +915,10 @@ Files:
 Checksums-Sha256:
  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 5 hello_1.dsc
  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 6 hello_1.tar.xz
-`), nil)
+`), func(pkg model.Package) error {
+		pkgs = append(pkgs, pkg)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -922,17 +930,52 @@ Checksums-Sha256:
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("source payloads = %#v, want %#v", got, want)
 	}
-	if pkgs[0].Checksums["MD5Sum"] == "" || pkgs[0].Checksums["SHA256"] == "" {
+	if pkgs[0].Checksums.MD5Sum == "" || pkgs[0].Checksums.SHA256 == "" {
 		t.Fatalf("checksums = %#v, want MD5Sum and SHA256", pkgs[0].Checksums)
+	}
+}
+
+func TestParsePackagesHandlesCRLFFinalParagraphAndLargeIgnoredField(t *testing.T) {
+	index := "Package: example\r\nArchitecture: amd64\r\nFilename: pool/e/example.deb\r\nSize: 7\r\nSHA256: " + strings.Repeat("a", 64) + "\r\nDescription: " + strings.Repeat("ignored", 100_000)
+	var packages []model.Package
+	if err := parsePackages(strings.NewReader(index), map[string]bool{"amd64": true}, func(pkg model.Package) error {
+		packages = append(packages, pkg)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(packages) != 1 || packages[0].Path != "pool/e/example.deb" || packages[0].Size != 7 {
+		t.Fatalf("packages = %#v", packages)
+	}
+}
+
+func BenchmarkParsePackagesStreaming(b *testing.B) {
+	var index strings.Builder
+	for i := 0; i < 10_000; i++ {
+		fmt.Fprintf(&index, "Package: package-%d\nArchitecture: amd64\nFilename: pool/p/package-%d.deb\nSize: 123\nSHA256: %s\nDescription: %s\n\n", i, i, strings.Repeat("a", 64), strings.Repeat("ignored", 20))
+	}
+	data := index.String()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		count := 0
+		err := parsePackages(strings.NewReader(data), map[string]bool{"amd64": true}, func(model.Package) error {
+			count++
+			return nil
+		})
+		if err != nil || count != 10_000 {
+			b.Fatalf("parsePackages count=%d error=%v", count, err)
+		}
 	}
 }
 
 func TestAptFileExpectedUsesOnlyExactAdvertisedPaths(t *testing.T) {
 	expected := aptFileExpected([]model.RepositoryFile{
-		{Path: "dists/resolute/main/dep11/icons-48x48.tar", Size: 100, SHA256: "raw"},
-		{Path: "dists/resolute/main/dep11/icons-48x48.tar.gz", Size: 50, SHA256: "gz"},
-		{Path: "dists/resolute/main/dep11/Components-amd64.yml", Size: 200, SHA256: "raw-yml"},
-		{Path: "dists/resolute/main/dep11/Components-amd64.yml.xz", Size: 80, SHA256: "xz-yml"},
+		{Path: "dists/resolute/main/dep11/icons-48x48.tar", Size: 100, Checksums: model.Checksums{SHA256: "raw"}},
+		{Path: "dists/resolute/main/dep11/icons-48x48.tar.gz", Size: 50, Checksums: model.Checksums{SHA256: "gz"}},
+		{Path: "dists/resolute/main/dep11/Components-amd64.yml", Size: 200, Checksums: model.Checksums{SHA256: "raw-yml"}},
+		{Path: "dists/resolute/main/dep11/Components-amd64.yml.xz", Size: 80, Checksums: model.Checksums{SHA256: "xz-yml"}},
 	})
 	if len(expected) != 4 {
 		t.Fatalf("expected files = %d, want 4", len(expected))
@@ -959,7 +1002,7 @@ func boolPtr(v bool) *bool {
 func releaseHashesFromPaths(paths ...string) map[string]releaseFile {
 	out := map[string]releaseFile{}
 	for i, p := range paths {
-		out[p] = releaseFile{Size: int64(i + 1), Checksums: map[string]string{"SHA256": "sha"}}
+		out[p] = releaseFile{Size: int64(i + 1), Checksums: model.Checksums{SHA256: "sha"}}
 	}
 	return out
 }

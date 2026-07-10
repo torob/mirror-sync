@@ -102,7 +102,7 @@ func deriveByHashFiles(files []model.RepositoryFile) ([]model.ByHashFile, error)
 				Algorithm:     algorithm,
 				Digest:        digest,
 				Size:          file.Size,
-				Checksums:     cloneChecksums(file.Checksums),
+				Checksums:     file.Checksums,
 			}
 			if existing, ok := byPath[destination]; ok {
 				if existing.Size != expected.Size || existing.Algorithm != expected.Algorithm ||

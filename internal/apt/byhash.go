@@ -281,10 +281,16 @@ func validateByHashHistory(history byHashHistory) error {
 }
 
 func updateByHashHistory(history byHashHistory, state model.RepositoryState) byHashHistory {
+	currentCanonical := map[string]bool{}
+	for _, current := range state.ByHashFiles {
+		currentCanonical[current.CanonicalPath] = true
+	}
 	records := map[string]byHashHistoryRecord{}
 	for _, record := range history.Records {
-		if enabled, known := state.ByHashEnabled[suiteFromCanonical(record.CanonicalPath)]; known && !enabled {
-			continue
+		if enabled, known := state.ByHashEnabled[suiteFromCanonical(record.CanonicalPath)]; known {
+			if !enabled || !currentCanonical[record.CanonicalPath] {
+				continue
+			}
 		}
 		record.Generations = append([]byHashHistoryGeneration(nil), record.Generations...)
 		records[historyRecordKey(record.CanonicalPath, record.Algorithm)] = record

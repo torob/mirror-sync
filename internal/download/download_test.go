@@ -79,6 +79,91 @@ func TestEnsureManyDownloadsConcurrentlyWithinGlobalLimit(t *testing.T) {
 	}
 }
 
+func TestResolveExactContinuesPastMirrorFailures(t *testing.T) {
+	good := []byte("signed-content")
+	expected := testExpected(map[string][]byte{"dists/stable/index": good})
+	for _, tt := range []struct {
+		name   string
+		mirror http.HandlerFunc
+	}{
+		{name: "404", mirror: func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }},
+		{name: "server error", mirror: func(w http.ResponseWriter, r *http.Request) { http.Error(w, "bad gateway", http.StatusBadGateway) }},
+		{name: "invalid content", mirror: func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("invalid")) }},
+		{name: "transport error", mirror: func(w http.ResponseWriter, r *http.Request) {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "cannot hijack", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mirror := httptest.NewServer(tt.mirror)
+			defer mirror.Close()
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(good) }))
+			defer primary.Close()
+			staging := t.TempDir()
+			resolved, err := ResolveExact(context.Background(), staging, []*httpx.Client{
+				testClient(t, mirror.URL, 2, 2), testClient(t, primary.URL, 2, 2),
+			}, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(resolved) != 1 || resolved[0].RelPath != expected[0].RelPath {
+				t.Fatalf("resolved = %#v, want exact file", resolved)
+			}
+			data, err := os.ReadFile(filepath.Join(staging, "payloads", filepath.FromSlash(expected[0].RelPath)))
+			if err != nil || !bytes.Equal(data, good) {
+				t.Fatalf("staged data = %q, err %v", data, err)
+			}
+		})
+	}
+}
+
+func TestResolveExactPrimaryFailureClassification(t *testing.T) {
+	good := []byte("signed-content")
+	expected := testExpected(map[string][]byte{"dists/stable/index": good})
+	for _, tt := range []struct {
+		name          string
+		primary       http.HandlerFunc
+		wantMissing   bool
+		wantErrorPart string
+	}{
+		{name: "404 is confirmed missing", primary: func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }, wantMissing: true},
+		{name: "server error is fatal", primary: func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}, wantErrorPart: "503 Service Unavailable"},
+		{name: "invalid content is fatal", primary: func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("invalid")) }, wantErrorPart: "size mismatch"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+			defer mirror.Close()
+			primary := httptest.NewServer(tt.primary)
+			defer primary.Close()
+			resolved, err := ResolveExact(context.Background(), t.TempDir(), []*httpx.Client{
+				testClient(t, mirror.URL, 2, 2), testClient(t, primary.URL, 2, 2),
+			}, expected)
+			if tt.wantErrorPart != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrorPart) {
+					t.Fatalf("ResolveExact error = %v, want %q", err, tt.wantErrorPart)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantMissing && len(resolved) != 0 {
+				t.Fatalf("resolved = %#v, want confirmed missing", resolved)
+			}
+		})
+	}
+}
+
 func TestEnsureManyHonorsPerSourceLimit(t *testing.T) {
 	data := map[string][]byte{
 		"pool/a.deb": []byte("package-a"),

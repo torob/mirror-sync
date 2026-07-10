@@ -3,6 +3,8 @@ package apt
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/ulikunitz/xz"
 
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/download"
@@ -184,6 +187,128 @@ func TestFetchStateAllowsReleaseAbsentPublishedBranchToBePruned(t *testing.T) {
 	}
 	if !reflect.DeepEqual(removed, []string{"dists/stable/main/binary-arm64/Packages.xz"}) {
 		t.Fatalf("removed = %#v, want stale branch pruned", removed)
+	}
+}
+
+func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) {
+	compressed := xzTestData(t, nil)
+	compressedDigest := sha256.Sum256(compressed)
+	emptyDigest := sha256.Sum256(nil)
+	release := []byte(fmt.Sprintf("Origin: example\nAcquire-By-Hash: yes\nSHA256:\n %x %d main/binary-amd64/Packages.xz\n %x 0 main/binary-amd64/Packages\n", compressedDigest, len(compressed), emptyDigest))
+	inRelease, keyring, _ := signedInRelease(t, release)
+
+	var mirrorSignedHits int
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/dists/stable/main/binary-amd64/Packages.xz":
+			_, _ = w.Write(compressed)
+		case "/dists/stable/InRelease", "/dists/stable/Release", "/dists/stable/Release.gpg":
+			mirrorSignedHits++
+			http.Error(w, "must not request signed metadata from mirror", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer mirror.Close()
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/dists/stable/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/stable/main/binary-amd64/Packages.xz":
+			http.Error(w, "mirror copy should be sufficient", http.StatusBadGateway)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer primary.Close()
+
+	publishRoot := t.TempDir()
+	stagingRoot := t.TempDir()
+	staleRaw := "dists/stable/main/binary-amd64/Packages"
+	writeTestFile(t, publishRoot, staleRaw, nil)
+	cfg := &config.Config{
+		Storage: config.Storage{Staging: stagingRoot},
+		Sync:    config.Sync{Download: config.Download{MaxInFlightRequests: 4}},
+	}
+	runner := &Runner{
+		Config: cfg,
+		Repo: config.APTRepository{
+			Name:           "repo",
+			AbsPublishPath: publishRoot,
+			AbsKeyring:     writeTestKeyring(t, keyring),
+			PrimarySource:  config.Source{URL: primary.URL},
+			MirrorSources:  []config.Source{{URL: mirror.URL}},
+			Architectures:  []string{"amd64"},
+			Suites:         []config.APTSuite{{Name: "stable", Components: []string{"main"}}},
+		},
+		HTTP: httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests())),
+	}
+
+	if _, err := runner.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mirrorSignedHits != 0 {
+		t.Fatalf("signed metadata requests to mirror = %d, want none", mirrorSignedHits)
+	}
+	compressedRel := "dists/stable/main/binary-amd64/Packages.xz"
+	if data, err := os.ReadFile(filepath.Join(publishRoot, filepath.FromSlash(compressedRel))); err != nil || !bytes.Equal(data, compressed) {
+		t.Fatalf("published exact compressed index = %q, err %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(publishRoot, filepath.FromSlash(staleRaw))); err != nil {
+		t.Fatalf("unresolved pre-existing raw file should remain before prune: %v", err)
+	}
+	resolved, status, err := runner.loadResolvedReleaseState()
+	if err != nil || status != resolvedReleaseStateValid {
+		t.Fatalf("resolved state status = %v, err %v", status, err)
+	}
+	paths, ok := resolved.paths("stable", releaseFingerprint(string(mustVerifyInRelease(t, inRelease, keyring))))
+	if !ok || !paths[compressedRel] || paths[staleRaw] {
+		t.Fatalf("resolved paths = %#v, found %t", paths, ok)
+	}
+	if _, err := runner.Verify(context.Background()); err != nil {
+		t.Fatalf("verify with confirmed missing raw variant: %v", err)
+	}
+	removed, err := runner.Prune(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed, []string{staleRaw}) {
+		t.Fatalf("pruned paths = %#v, want unresolved raw path", removed)
+	}
+	for _, byHash := range mustReadPublishedState(t, runner).ByHashFiles {
+		if byHash.CanonicalPath != compressedRel {
+			t.Fatalf("by-hash derived for unresolved path: %#v", byHash)
+		}
+	}
+}
+
+func TestSyncFailsOnNon404PrimaryDistsFailureBeforePublishingMetadata(t *testing.T) {
+	wantData := []byte("index")
+	digest := sha256.Sum256(wantData)
+	release := []byte(fmt.Sprintf("Origin: example\nSHA256:\n %x %d main/binary-amd64/Packages\n", digest, len(wantData)))
+	inRelease, keyring, _ := signedInRelease(t, release)
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/dists/stable/InRelease" {
+			_, _ = w.Write(inRelease)
+			return
+		}
+		if req.URL.Path == "/dists/stable/main/binary-amd64/Packages" {
+			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+			return
+		}
+		http.NotFound(w, req)
+	}))
+	defer primary.Close()
+
+	publishRoot := t.TempDir()
+	runner := testFetchStateRunner(t, primary.URL, writeTestKeyring(t, keyring), publishRoot, []string{"amd64"})
+	_, err := runner.Sync(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "503 Service Unavailable") {
+		t.Fatalf("Sync error = %v, want primary 503", err)
+	}
+	if _, err := os.Stat(filepath.Join(publishRoot, "dists", "stable", "InRelease")); !os.IsNotExist(err) {
+		t.Fatalf("new signed metadata was published after failed exact file: %v", err)
 	}
 }
 
@@ -696,7 +821,7 @@ Checksums-Sha256:
 	}
 }
 
-func TestAptFileExpectedVerifiesAndCanMaterializeRawFromCompressedSiblings(t *testing.T) {
+func TestAptFileExpectedUsesOnlyExactAdvertisedPaths(t *testing.T) {
 	expected := aptFileExpected([]model.RepositoryFile{
 		{Path: "dists/resolute/main/dep11/icons-48x48.tar", Size: 100, SHA256: "raw"},
 		{Path: "dists/resolute/main/dep11/icons-48x48.tar.gz", Size: 50, SHA256: "gz"},
@@ -710,18 +835,12 @@ func TestAptFileExpectedVerifiesAndCanMaterializeRawFromCompressedSiblings(t *te
 	if rawIcons.RelPath != "dists/resolute/main/dep11/icons-48x48.tar" || !rawIcons.VerifyOnSync {
 		t.Fatalf("raw icon expectation = %#v", rawIcons)
 	}
-	wantIconSources := []string{
-		"dists/resolute/main/dep11/icons-48x48.tar:",
-		"dists/resolute/main/dep11/icons-48x48.tar.gz:gzip",
-	}
+	wantIconSources := []string{}
 	if got := sourceDescriptions(rawIcons.Sources); !reflect.DeepEqual(got, wantIconSources) {
 		t.Fatalf("raw icon sources = %#v, want %#v", got, wantIconSources)
 	}
 	rawYML := expected[0]
-	wantYMLSources := []string{
-		"dists/resolute/main/dep11/Components-amd64.yml:",
-		"dists/resolute/main/dep11/Components-amd64.yml.xz:xz",
-	}
+	wantYMLSources := []string{}
 	if got := sourceDescriptions(rawYML.Sources); !reflect.DeepEqual(got, wantYMLSources) {
 		t.Fatalf("raw yml sources = %#v, want %#v", got, wantYMLSources)
 	}
@@ -854,9 +973,43 @@ func writeTestFile(t *testing.T, root, rel string, data []byte) {
 	}
 }
 
+func xzTestData(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w, err := xz.NewWriter(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func mustVerifyInRelease(t *testing.T, data []byte, keyring openpgp.EntityList) []byte {
+	t.Helper()
+	plain, err := verifyInRelease(data, keyring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plain
+}
+
+func mustReadPublishedState(t *testing.T, runner *Runner) model.RepositoryState {
+	t.Helper()
+	state, err := runner.readPublishedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
 func testFetchStateRunner(t *testing.T, url, keyringPath, publishRoot string, archs []string) *Runner {
 	t.Helper()
-	cfg := &config.Config{Sync: config.Sync{Download: config.Download{MaxInFlightRequests: 4}}}
+	cfg := &config.Config{Storage: config.Storage{Staging: t.TempDir()}, Sync: config.Sync{Download: config.Download{MaxInFlightRequests: 4}}}
 	factory := httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests()))
 	return &Runner{
 		Config: cfg,

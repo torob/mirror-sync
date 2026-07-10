@@ -92,16 +92,27 @@ func (r *Runner) Sync(ctx context.Context) (model.OperationStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	downloadStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state))
-	stats.Add(downloadStats)
+	fileStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(state.Files))
+	stats.Add(fileStats)
+	if err != nil {
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
+	packageStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
+	stats.Add(packageStats)
 	if err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if err := r.materializeByHash(state.ByHashFiles); err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
+	if err := r.prepareResolvedReleaseState(state); err != nil {
+		return stats, fmt.Errorf("apt %s write resolved Release state: %w", r.Repo.Name, err)
+	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), state.Metadata); err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
+	if err := r.commitResolvedReleaseState(state); err != nil {
+		return stats, fmt.Errorf("apt %s commit resolved Release state: %w", r.Repo.Name, err)
 	}
 	history = updateByHashHistory(history, state)
 	if err := r.writeByHashHistory(history); err != nil {
@@ -219,7 +230,11 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, Packages: map[string]model.Package{}}
+	clients, err := r.distsClients()
+	if err != nil {
+		return model.RepositoryState{}, err
+	}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Package{}}
 	for _, suite := range r.Repo.Suites {
 		releaseText, releaseHashes, metadata, err := r.fetchRelease(ctx, client, keyring, suite.Name)
 		if err != nil {
@@ -230,11 +245,17 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 			return out, err
 		}
 		out.ByHashEnabled[suite.Name] = byHashEnabled
+		out.ReleaseFingerprints[suite.Name] = releaseFingerprint(releaseText)
 		out.Metadata = append(out.Metadata, metadata...)
-		files, err := selectReleaseFiles(suite, r.Repo.Architectures, releaseHashes)
+		advertised, err := selectReleaseFiles(suite, r.Repo.Architectures, releaseHashes)
 		if err != nil {
 			return out, err
 		}
+		resolved, err := download.ResolveExact(ctx, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(advertised))
+		if err != nil {
+			return out, fmt.Errorf("apt %s resolve suite %s: %w", r.Repo.Name, suite.Name, err)
+		}
+		files := repositoryFilesFromExpected(resolved)
 		out.Files = append(out.Files, files...)
 		if byHashEnabled {
 			byHashFiles, err := deriveByHashFiles(files)
@@ -245,7 +266,7 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 		}
 		for _, component := range suite.Components {
 			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
-				indexRel, indexData, found, err := r.fetchPackagesIndex(ctx, client, suite.Name, component, arch, releaseHashes)
+				indexRel, indexData, found, err := r.readResolvedPackagesIndex(suite.Name, component, arch, releaseHashes, files)
 				if err != nil {
 					return out, err
 				}
@@ -264,7 +285,7 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 				}
 			}
 			for _, arch := range selectedArchitectureNames(r.Repo.Architectures) {
-				indexRel, indexData, found, err := r.fetchInstallerPackagesIndex(ctx, client, suite.Name, component, arch, releaseHashes)
+				indexRel, indexData, found, err := r.readResolvedInstallerIndex(suite.Name, component, arch, releaseHashes, files)
 				if err != nil {
 					return out, err
 				}
@@ -282,7 +303,7 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 					}
 				}
 			}
-			indexRel, indexData, found, err := r.fetchSourcesIndex(ctx, client, suite.Name, component, releaseHashes)
+			indexRel, indexData, found, err := r.readResolvedSourcesIndex(suite.Name, component, releaseHashes, files)
 			if err != nil {
 				return out, err
 			}
@@ -446,31 +467,41 @@ func verifiedReleaseMetadata(cleartext []byte, metadata []model.MetadataFile) (*
 	return &verifiedRelease{text: text, cleartext: cleartext, hashes: hashes, metadata: metadata}, nil
 }
 
-func (r *Runner) fetchPackagesIndex(ctx context.Context, client *httpx.Client, suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.fetchIndex(ctx, client, suite, path.Join(component, "binary-"+arch), "Packages", hashes)
+func repositoryFilesFromExpected(expected []download.Expected) []model.RepositoryFile {
+	files := make([]model.RepositoryFile, 0, len(expected))
+	for _, exp := range expected {
+		files = append(files, model.RepositoryFile{
+			Path: exp.RelPath, Size: exp.Size, SHA256: exp.SHA256, Checksums: cloneChecksums(exp.Checksums),
+		})
+	}
+	return files
 }
 
-func (r *Runner) fetchInstallerPackagesIndex(ctx context.Context, client *httpx.Client, suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.fetchIndex(ctx, client, suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes)
+func (r *Runner) readResolvedPackagesIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
+	return r.readResolvedNamedIndex(suite, path.Join(component, "binary-"+arch), "Packages", hashes, files)
 }
 
-func (r *Runner) fetchSourcesIndex(ctx context.Context, client *httpx.Client, suite, component string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	return r.fetchIndex(ctx, client, suite, path.Join(component, "source"), "Sources", hashes)
+func (r *Runner) readResolvedInstallerIndex(suite, component, arch string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
+	return r.readResolvedNamedIndex(suite, path.Join(component, "debian-installer", "binary-"+arch), "Packages", hashes, files)
 }
 
-func (r *Runner) fetchIndex(ctx context.Context, client *httpx.Client, suite, dir, name string, hashes map[string]releaseFile) (string, []byte, bool, error) {
-	candidates := indexCandidates(dir, name)
-	for _, rel := range candidates {
-		want, ok := hashes[rel]
-		if !ok {
+func (r *Runner) readResolvedSourcesIndex(suite, component string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
+	return r.readResolvedNamedIndex(suite, path.Join(component, "source"), "Sources", hashes, files)
+}
+
+func (r *Runner) readResolvedNamedIndex(suite, dir, name string, hashes map[string]releaseFile, files []model.RepositoryFile) (string, []byte, bool, error) {
+	resolved := map[string]bool{}
+	for _, file := range files {
+		resolved[file.Path] = true
+	}
+	for _, rel := range indexCandidates(dir, name) {
+		fullRel := path.Join("dists", suite, rel)
+		if _, advertised := hashes[rel]; !advertised || !resolved[fullRel] {
 			continue
 		}
-		data, err := client.GetBytes(ctx, path.Join("dists", suite, rel), want.Size+1)
+		data, err := os.ReadFile(filepathFor(path.Join(repoStaging(r.Config, "apt", r.Repo.Name), "payloads"), fullRel))
 		if err != nil {
 			return "", nil, false, err
-		}
-		if err := verifyBytes(data, want); err != nil {
-			return "", nil, false, fmt.Errorf("apt %s index %s checksum mismatch", r.Repo.Name, rel)
 		}
 		return rel, data, true, nil
 	}
@@ -487,6 +518,15 @@ func (r *Runner) readPublishedState() (model.RepositoryState, error) {
 		hashes, err := r.readPublishedReleaseHashes(suite.Name)
 		if err != nil {
 			return out, err
+		}
+		resolved := map[string]bool{}
+		for _, file := range out.Files {
+			resolved[file.Path] = true
+		}
+		for rel := range hashes {
+			if !resolved[path.Join("dists", suite.Name, rel)] {
+				delete(hashes, rel)
+			}
 		}
 		hashesBySuite[suite.Name] = hashes
 	}
@@ -564,7 +604,11 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, Packages: map[string]model.Package{}}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Package{}}
+	resolvedState, resolvedStatus, err := r.loadResolvedReleaseState()
+	if err != nil {
+		return out, err
+	}
 	for _, suite := range r.Repo.Suites {
 		releaseText, hashes, metadata, err := r.readPublishedSuiteRelease(keyring, suite.Name)
 		if err != nil {
@@ -576,9 +620,18 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 			return out, err
 		}
 		out.ByHashEnabled[suite.Name] = byHashEnabled
+		fingerprint := releaseFingerprint(releaseText)
+		out.ReleaseFingerprints[suite.Name] = fingerprint
 		files, err := selectReleaseFiles(suite, r.Repo.Architectures, hashes)
 		if err != nil {
 			return out, err
+		}
+		if resolvedStatus == resolvedReleaseStateValid {
+			paths, ok := resolvedState.paths(suite.Name, fingerprint)
+			if !ok {
+				return out, fmt.Errorf("apt %s has no resolved-path state for suite %s Release %s", r.Repo.Name, suite.Name, fingerprint)
+			}
+			files = filterRepositoryFiles(files, paths)
 		}
 		out.Files = append(out.Files, files...)
 		if byHashEnabled {
@@ -1354,13 +1407,6 @@ func sortedPackages(m map[string]model.Package) []model.Package {
 	return out
 }
 
-func aptExpected(state model.RepositoryState) []download.Expected {
-	var expected []download.Expected
-	expected = append(expected, aptFileExpected(state.Files)...)
-	expected = append(expected, aptPackageExpected(state.Packages)...)
-	return expected
-}
-
 func aptPackageExpected(packages map[string]model.Package) []download.Expected {
 	var expected []download.Expected
 	for _, pkg := range sortedPackages(packages) {
@@ -1373,10 +1419,6 @@ func aptPackageExpected(packages map[string]model.Package) []download.Expected {
 
 func aptFileExpected(files []model.RepositoryFile) []download.Expected {
 	files = sortedFiles(files)
-	fileSet := map[string]bool{}
-	for _, f := range files {
-		fileSet[f.Path] = true
-	}
 	expected := make([]download.Expected, 0, len(files))
 	for _, f := range files {
 		expected = append(expected, download.Expected{
@@ -1385,7 +1427,6 @@ func aptFileExpected(files []model.RepositoryFile) []download.Expected {
 			SHA256:       f.SHA256,
 			Checksums:    cloneChecksums(f.Checksums),
 			VerifyOnSync: true,
-			Sources:      releaseFileSources(f.Path, fileSet),
 		})
 	}
 	return expected
@@ -1397,22 +1438,48 @@ func sortedFiles(files []model.RepositoryFile) []model.RepositoryFile {
 	return out
 }
 
-func releaseFileSources(rel string, fileSet map[string]bool) []download.Source {
-	sources := []download.Source{{RelPath: rel}}
-	if strings.HasSuffix(rel, ".gz") || strings.HasSuffix(rel, ".xz") {
-		return sources
-	}
-	if fileSet[rel+".xz"] {
-		sources = append(sources, download.Source{RelPath: rel + ".xz", Decompress: "xz"})
-	}
-	if fileSet[rel+".gz"] {
-		sources = append(sources, download.Source{RelPath: rel + ".gz", Decompress: "gzip"})
-	}
-	return sources
-}
-
 func repoStaging(cfg *config.Config, kind, name string) string {
 	return path.Join(cfg.Storage.Staging, "repos", kind, name)
+}
+
+func releaseFingerprint(text string) string {
+	digest := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(digest[:])
+}
+
+func filterRepositoryFiles(files []model.RepositoryFile, paths map[string]bool) []model.RepositoryFile {
+	out := make([]model.RepositoryFile, 0, len(files))
+	for _, file := range files {
+		if paths[file.Path] {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+func (r *Runner) distsClients() ([]*httpx.Client, error) {
+	sources := make([]config.EffectiveSource, 0, len(r.Repo.MirrorSources)+1)
+	for i, mirror := range r.Repo.MirrorSources {
+		effective, err := r.Config.Source(r.Repo.Name, config.RepoAPT, config.SourceMirror, i, mirror)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, effective)
+	}
+	primary, err := r.Config.Source(r.Repo.Name, config.RepoAPT, config.SourcePrimary, 0, r.Repo.PrimarySource)
+	if err != nil {
+		return nil, err
+	}
+	sources = append(sources, primary)
+	clients := make([]*httpx.Client, 0, len(sources))
+	for _, source := range sources {
+		client, err := r.HTTP.Client(source)
+		if err != nil {
+			return nil, err
+		}
+		clients = append(clients, client)
+	}
+	return clients, nil
 }
 
 func filepathFor(root, rel string) string {

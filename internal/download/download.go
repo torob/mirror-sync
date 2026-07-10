@@ -43,6 +43,86 @@ type Expected struct {
 
 type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expected) (model.OperationStats, error)
 
+// ResolveExact downloads each expected path from the clients in order and keeps
+// valid copies in staging. A file is reported missing only when the final
+// (authoritative) client returns 404 after every earlier source failed.
+func ResolveExact(ctx context.Context, stagingRoot string, clients []*httpx.Client, expected []Expected) ([]Expected, error) {
+	if len(expected) == 0 {
+		return nil, nil
+	}
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("no download sources configured")
+	}
+	type indexedExpected struct {
+		index int
+		exp   Expected
+	}
+	workers := workerCount(clients, len(expected))
+	g, ctx := errgroup.WithContext(ctx)
+	jobs := make(chan indexedExpected)
+	found := make([]bool, len(expected))
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			for job := range jobs {
+				resolved, err := resolveExactOne(ctx, stagingRoot, clients, job.exp)
+				if err != nil {
+					return err
+				}
+				found[job.index] = resolved
+			}
+			return nil
+		})
+	}
+	for i, exp := range expected {
+		select {
+		case jobs <- indexedExpected{index: i, exp: exp}:
+		case <-ctx.Done():
+			close(jobs)
+			return nil, g.Wait()
+		}
+	}
+	close(jobs)
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	resolved := make([]Expected, 0, len(expected))
+	for i, exp := range expected {
+		if found[i] {
+			resolved = append(resolved, exp)
+		}
+	}
+	return resolved, nil
+}
+
+func resolveExactOne(ctx context.Context, stagingRoot string, clients []*httpx.Client, exp Expected) (bool, error) {
+	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), exp.RelPath)
+	if err != nil {
+		return false, err
+	}
+	if ok, err := publish.Verify(staged,
+		publish.WithSize(exp.Size),
+		checksumVerifyOption(exp),
+		publish.WithCheck(exp.Verify),
+	); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
+	os.Remove(staged)
+	var failures []string
+	for i, client := range clients {
+		_, err := downloadOne(ctx, client, exp, Source{RelPath: exp.RelPath}, staged)
+		if err == nil {
+			return true, nil
+		}
+		failures = append(failures, fmt.Sprintf("source %s: %v", client.Host(), err))
+		if i == len(clients)-1 && httpx.IsStatus(err, http.StatusNotFound) {
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("all sources failed for %s: %s", exp.RelPath, strings.Join(failures, "; "))
+}
+
 func EnsureSynced(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) (model.OperationStats, error) {
 	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureSyncedOne)
 }

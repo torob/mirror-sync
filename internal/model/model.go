@@ -42,11 +42,12 @@ type RepositoryPlan struct {
 }
 
 type RepositoryState struct {
-	Metadata      []MetadataFile
-	Files         []RepositoryFile
-	ByHashFiles   []ByHashFile
-	ByHashEnabled map[string]bool
-	Packages      map[string]Package
+	Metadata            []MetadataFile
+	Files               []RepositoryFile
+	ByHashFiles         []ByHashFile
+	ByHashEnabled       map[string]bool
+	ReleaseFingerprints map[string]string
+	Packages            map[string]Package
 }
 
 type OperationStats struct {

@@ -21,6 +21,15 @@ type RepositoryFile struct {
 	Checksums map[string]string
 }
 
+type ByHashFile struct {
+	CanonicalPath string
+	Path          string
+	Algorithm     string
+	Digest        string
+	Size          int64
+	Checksums     map[string]string
+}
+
 type RepositoryPlan struct {
 	Name          string
 	Kind          string
@@ -33,7 +42,9 @@ type RepositoryPlan struct {
 }
 
 type RepositoryState struct {
-	Metadata []MetadataFile
-	Files    []RepositoryFile
-	Packages map[string]Package
+	Metadata      []MetadataFile
+	Files         []RepositoryFile
+	ByHashFiles   []ByHashFile
+	ByHashEnabled map[string]bool
+	Packages      map[string]Package
 }

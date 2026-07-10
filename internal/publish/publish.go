@@ -29,6 +29,8 @@ const (
 	PublishedDirMode  os.FileMode = 0o755
 )
 
+var linkFile = os.Link
+
 func AcquireLock(stagingRoot, kind, name string) (*Lock, error) {
 	lockName := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(kind + "-" + name + ".lock")
 	lockPath := filepath.Join(stagingRoot, "locks", lockName)
@@ -256,6 +258,157 @@ func PublishFile(root, staged, final string) error {
 		return err
 	}
 	return syncDir(filepath.Dir(final))
+}
+
+// MaterializeByHash publishes an immutable hash-addressed copy of a verified
+// canonical repository file. It prefers a hard link and falls back to a
+// bounded, checksum-verifying copy when links are unavailable.
+func MaterializeByHash(root, stagingRoot string, expected model.ByHashFile) error {
+	canonical, err := safe.Join(root, expected.CanonicalPath)
+	if err != nil {
+		return err
+	}
+	final, err := safe.Join(root, expected.Path)
+	if err != nil {
+		return err
+	}
+	if ok, err := verifyRegularNoSymlink(final, expected.Size, expected.Algorithm, expected.Digest); err != nil {
+		return err
+	} else if ok {
+		if err := ensurePublishedDirs(root, filepath.Dir(final)); err != nil {
+			return err
+		}
+		if err := os.Chmod(final, PublishedFileMode); err != nil {
+			return err
+		}
+		return syncFile(final)
+	}
+	if ok, err := verifyRegularNoSymlink(canonical, expected.Size, expected.Algorithm, expected.Digest); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("canonical file %s does not match %s:%s", expected.CanonicalPath, expected.Algorithm, expected.Digest)
+	}
+
+	staged, err := safe.Join(filepath.Join(stagingRoot, "by-hash"), expected.Path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(staged), PublishedDirMode); err != nil {
+		return err
+	}
+	if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	partial := staged + ".partial"
+	if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := linkFile(canonical, staged); err != nil {
+		if err := copyByHash(canonical, partial, expected); err != nil {
+			return err
+		}
+		if err := os.Rename(partial, staged); err != nil {
+			os.Remove(partial)
+			return err
+		}
+	}
+	complete := false
+	defer func() {
+		if !complete {
+			os.Remove(staged)
+			os.Remove(partial)
+		}
+	}()
+	if ok, err := verifyRegularNoSymlink(staged, expected.Size, expected.Algorithm, expected.Digest); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("staged by-hash file %s failed verification", expected.Path)
+	}
+	if err := os.Chmod(staged, PublishedFileMode); err != nil {
+		return err
+	}
+	if err := syncFile(staged); err != nil {
+		return err
+	}
+	if err := PublishFile(root, staged, final); err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
+
+func VerifyByHash(path string, size int64, algorithm, digest string) (bool, error) {
+	return verifyRegularNoSymlink(path, size, algorithm, digest)
+}
+
+func verifyRegularNoSymlink(file string, size int64, algorithm, digest string) (bool, error) {
+	st, err := os.Lstat(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !st.Mode().IsRegular() || st.Size() != size {
+		return false, nil
+	}
+	got, err := checksumFile(file, algorithm)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(got, digest), nil
+}
+
+func copyByHash(source, destination string, expected model.ByHashFile) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, PublishedFileMode)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		out.Close()
+		if !ok {
+			os.Remove(destination)
+		}
+	}()
+	h, err := newHash(expected.Algorithm)
+	if err != nil {
+		return err
+	}
+	written, err := io.CopyBuffer(io.MultiWriter(out, h), in, make([]byte, 128*1024))
+	if err != nil {
+		return err
+	}
+	if written != expected.Size {
+		return fmt.Errorf("size mismatch got %d want %d", written, expected.Size)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, expected.Digest) {
+		return fmt.Errorf("%s mismatch got %s want %s", strings.ToLower(expected.Algorithm), got, expected.Digest)
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
+
+func syncFile(file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func ensurePublishedDirs(root, dir string) error {

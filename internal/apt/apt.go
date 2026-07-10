@@ -56,7 +56,7 @@ func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
 	}
 	return model.RepositoryPlan{
 		Name: r.Repo.Name, Kind: "apt", PublishPath: r.Repo.AbsPublishPath,
-		MetadataFiles: len(state.Metadata) + len(state.Files), Packages: len(state.Packages), Bytes: bytes,
+		MetadataFiles: len(state.Metadata) + len(state.Files) + len(state.ByHashFiles), Packages: len(state.Packages), Bytes: bytes,
 		Sources: r.sourceDescriptions(),
 	}, nil
 }
@@ -67,9 +67,24 @@ func (r *Runner) Sync(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
+	oldState, oldPublished, err := r.readPublishedReleaseStateOptional()
+	oldStateUnsafe := err != nil
+	if oldStateUnsafe {
+		oldPublished = false
+	}
+	history, historyStatus, err := r.loadByHashHistory()
+	if err != nil {
+		return fmt.Errorf("apt %s read by-hash history: %w", r.Repo.Name, err)
+	}
+	if oldPublished {
+		history = updateByHashHistory(history, oldState)
+	}
 	state, err := r.fetchState(ctx)
 	if err != nil {
 		return err
+	}
+	if oldPublished {
+		r.preserveByHash(oldState.ByHashFiles)
 	}
 	clients, err := r.payloadClients()
 	if err != nil {
@@ -78,11 +93,18 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state)); err != nil {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
+	if err := r.materializeByHash(state.ByHashFiles); err != nil {
+		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), state.Metadata); err != nil {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
+	history = updateByHashHistory(history, state)
+	if err := r.writeByHashHistory(history); err != nil {
+		return fmt.Errorf("apt %s write by-hash history: %w", r.Repo.Name, err)
+	}
 	if r.Config.Sync.Prune {
-		_, err := r.pruneState(state)
+		_, err := r.pruneStateWithHistory(state, history, historyStatus == byHashHistoryCorrupt || oldStateUnsafe)
 		return err
 	}
 	return nil
@@ -105,6 +127,10 @@ func (r *Runner) Verify(ctx context.Context) error {
 	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(releaseState.Files)); err != nil {
 		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
+	if err := r.materializeByHash(releaseState.ByHashFiles); err != nil {
+		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	}
+	r.verifyHistoricByHash()
 	state, err := r.readPublishedState()
 	if err != nil {
 		return err
@@ -116,6 +142,11 @@ func (r *Runner) Verify(ctx context.Context) error {
 }
 
 func (r *Runner) Prune(ctx context.Context) ([]string, error) {
+	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apt", r.Repo.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
 	state, err := r.readPublishedState()
 	if err != nil {
 		return nil, err
@@ -125,6 +156,20 @@ func (r *Runner) Prune(ctx context.Context) ([]string, error) {
 }
 
 func (r *Runner) pruneState(state model.RepositoryState) ([]string, error) {
+	history, status, err := r.loadByHashHistory()
+	if err != nil {
+		return nil, err
+	}
+	if status == byHashHistoryMissing {
+		history = updateByHashHistory(history, state)
+		if err := r.writeByHashHistory(history); err != nil {
+			return nil, err
+		}
+	}
+	return r.pruneStateWithHistory(state, history, status == byHashHistoryCorrupt)
+}
+
+func (r *Runner) pruneStateWithHistory(state model.RepositoryState, history byHashHistory, protectUnknown bool) ([]string, error) {
 	keep := map[string]bool{}
 	for _, mf := range state.Metadata {
 		keep[mf.Path] = true
@@ -132,8 +177,21 @@ func (r *Runner) pruneState(state model.RepositoryState) ([]string, error) {
 	for _, f := range state.Files {
 		keep[f.Path] = true
 	}
+	for _, f := range state.ByHashFiles {
+		keep[f.Path] = true
+	}
+	for _, record := range history.Records {
+		for _, generation := range record.Generations {
+			keep[generation.Path] = true
+		}
+	}
 	for rel := range state.Packages {
 		keep[rel] = true
+	}
+	if protectUnknown {
+		if err := keepExistingByHash(r.Repo.AbsPublishPath, keep); err != nil {
+			return nil, err
+		}
 	}
 	return publish.Prune(r.Repo.AbsPublishPath, keep)
 }
@@ -151,19 +209,30 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{Packages: map[string]model.Package{}}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, Packages: map[string]model.Package{}}
 	for _, suite := range r.Repo.Suites {
 		releaseText, releaseHashes, metadata, err := r.fetchRelease(ctx, client, keyring, suite.Name)
 		if err != nil {
 			return out, err
 		}
-		_ = releaseText
+		byHashEnabled, err := parseAcquireByHash(releaseText)
+		if err != nil {
+			return out, err
+		}
+		out.ByHashEnabled[suite.Name] = byHashEnabled
 		out.Metadata = append(out.Metadata, metadata...)
 		files, err := selectReleaseFiles(suite, r.Repo.Architectures, releaseHashes)
 		if err != nil {
 			return out, err
 		}
 		out.Files = append(out.Files, files...)
+		if byHashEnabled {
+			byHashFiles, err := deriveByHashFiles(files)
+			if err != nil {
+				return out, err
+			}
+			out.ByHashFiles = append(out.ByHashFiles, byHashFiles...)
+		}
 		for _, component := range suite.Components {
 			for _, arch := range packageIndexArchitectures(r.Repo.Architectures) {
 				indexRel, indexData, found, err := r.fetchPackagesIndex(ctx, client, suite.Name, component, arch, releaseHashes)
@@ -235,6 +304,9 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 		if err != nil {
 			return "", nil, nil, err
 		}
+		if _, err := parseAcquireByHash(string(plain)); err != nil {
+			return "", nil, nil, err
+		}
 		metadata := []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}}
 		releaseRel := path.Join("dists", suite, "Release")
 		if releaseData, err := client.GetBytes(ctx, releaseRel, 64<<20); err == nil {
@@ -260,6 +332,9 @@ func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring
 	}
 	hashes, err := parseReleaseHashes(string(releaseData))
 	if err != nil {
+		return "", nil, nil, err
+	}
+	if _, err := parseAcquireByHash(string(releaseData)); err != nil {
 		return "", nil, nil, err
 	}
 	return string(releaseData), hashes, []model.MetadataFile{
@@ -386,7 +461,7 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
-	out := model.RepositoryState{Packages: map[string]model.Package{}}
+	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, Packages: map[string]model.Package{}}
 	for _, suite := range r.Repo.Suites {
 		var releaseText string
 		var hashes map[string]releaseFile
@@ -430,12 +505,23 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 			}
 			out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData}, model.MetadataFile{Path: sigRel, Data: sig, SignedLast: true})
 		}
-		_ = releaseText
+		byHashEnabled, err := parseAcquireByHash(releaseText)
+		if err != nil {
+			return out, err
+		}
+		out.ByHashEnabled[suite.Name] = byHashEnabled
 		files, err := selectReleaseFiles(suite, r.Repo.Architectures, hashes)
 		if err != nil {
 			return out, err
 		}
 		out.Files = append(out.Files, files...)
+		if byHashEnabled {
+			byHashFiles, err := deriveByHashFiles(files)
+			if err != nil {
+				return out, err
+			}
+			out.ByHashFiles = append(out.ByHashFiles, byHashFiles...)
+		}
 	}
 	return out, nil
 }
@@ -649,6 +735,9 @@ func parseReleaseHashes(text string) (map[string]releaseFile, error) {
 			size, err := strconv.ParseInt(fields[1], 10, 64)
 			if err != nil {
 				return nil, err
+			}
+			if size < 0 {
+				return nil, fmt.Errorf("%s has negative size in Release", fields[2])
 			}
 			existing := out[fields[2]]
 			if existing.Checksums == nil {

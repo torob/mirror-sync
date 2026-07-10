@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -172,6 +173,141 @@ func TestVerifyOptions(t *testing.T) {
 				t.Fatalf("Verify() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMaterializeByHashHardLinksImmutableContent(t *testing.T) {
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
+
+	root := t.TempDir()
+	staging := t.TempDir()
+	canonicalRel := "dists/noble/main/binary-amd64/Packages"
+	canonical := filepath.Join(root, filepath.FromSlash(canonicalRel))
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("old-index")
+	if err := os.WriteFile(canonical, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	digestHex := hex.EncodeToString(digest[:])
+	destinationRel := "dists/noble/main/binary-amd64/by-hash/SHA256/" + digestHex
+	expected := model.ByHashFile{
+		CanonicalPath: canonicalRel,
+		Path:          destinationRel,
+		Algorithm:     "SHA256",
+		Digest:        digestHex,
+		Size:          int64(len(data)),
+	}
+	if err := MaterializeByHash(root, staging, expected); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, filepath.FromSlash(destinationRel))
+	canonicalInfo, err := os.Stat(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationInfo, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(canonicalInfo, destinationInfo) {
+		t.Fatal("by-hash object is not hard-linked to the canonical file")
+	}
+	assertMode(t, destination, PublishedFileMode)
+	assertMode(t, filepath.Dir(destination), PublishedDirMode)
+	if err := os.Chmod(destination, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeByHash(root, staging, expected); err != nil {
+		t.Fatal(err)
+	}
+	assertMode(t, destination, PublishedFileMode)
+	assertMode(t, filepath.Dir(destination), PublishedDirMode)
+
+	replacement := canonical + ".replacement"
+	if err := os.WriteFile(replacement, []byte("new-index"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, canonical); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		t.Fatalf("by-hash content = %q, want immutable old bytes %q", got, data)
+	}
+}
+
+func TestMaterializeByHashFallsBackToCopyAndReplacesSymlink(t *testing.T) {
+	root := t.TempDir()
+	staging := t.TempDir()
+	canonicalRel := "dists/noble/main/source/Sources.xz"
+	canonical := filepath.Join(root, filepath.FromSlash(canonicalRel))
+	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("source-index")
+	if err := os.WriteFile(canonical, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha512.Sum512(data)
+	digestHex := hex.EncodeToString(digest[:])
+	destinationRel := "dists/noble/main/source/by-hash/SHA512/" + digestHex
+	destination := filepath.Join(root, filepath.FromSlash(destinationRel))
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(canonical, destination); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLinkFile := linkFile
+	linkFile = func(string, string) error { return errors.New("injected link failure") }
+	t.Cleanup(func() { linkFile = oldLinkFile })
+	expected := model.ByHashFile{
+		CanonicalPath: canonicalRel,
+		Path:          destinationRel,
+		Algorithm:     "SHA512",
+		Digest:        digestHex,
+		Size:          int64(len(data)),
+	}
+	if err := MaterializeByHash(root, staging, expected); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("destination mode = %s, want regular file", info.Mode())
+	}
+	canonicalInfo, _ := os.Stat(canonical)
+	if os.SameFile(canonicalInfo, info) {
+		t.Fatal("copy fallback unexpectedly shares the canonical inode")
+	}
+	if matches, err := VerifyByHash(destination, int64(len(data)), "SHA512", digestHex); err != nil || !matches {
+		t.Fatalf("VerifyByHash() = %t, %v", matches, err)
+	}
+	var partials []string
+	err = filepath.WalkDir(staging, func(file string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() && filepath.Ext(file) == ".partial" {
+			partials = append(partials, file)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(partials) != 0 {
+		t.Fatalf("partial files remain: %v", partials)
 	}
 }
 

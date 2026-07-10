@@ -605,6 +605,24 @@ For each configured APT suite, component, and architecture, `mirrorsync` must:
   and skip it.
 - Verify each index against hashes from the verified `Release` file, preferring
   the strongest supported checksum present.
+- Treat `Acquire-By-Hash` as an optional Deb822 boolean whose default is `no`.
+  When it is `yes`, publish each selected, locally served index at its canonical
+  path and at `<index-dir>/by-hash/<algorithm>/<digest>` for every advertised
+  supported checksum (`SHA512`, `SHA256`, `SHA1`, and `MD5Sum`).
+- Derive by-hash paths only from verified `Release` cleartext. Do not fetch
+  upstream by-hash URLs, crawl directory listings, alter upstream metadata, or
+  create by-hash objects for package payloads or suite-level signed metadata.
+- Publish by-hash objects as regular files or hard links whose bytes remain
+  unchanged when the canonical index path is atomically replaced. Symlinks to
+  mutable canonical paths are not valid by-hash objects.
+- Make all current canonical indexes and by-hash objects visible before
+  publishing a new `Release`, `Release.gpg`, or `InRelease`.
+- Retain the current and two previous distinct by-hash objects per canonical
+  index and checksum algorithm when pruning is enabled. Store the versioned,
+  atomically updated retention manifest under repository staging state, never
+  inside the served repository.
+- When newly published signed metadata changes `Acquire-By-Hash` to `no`,
+  update retention state before pruning the suite's obsolete by-hash objects.
 - Parse binary package entries for `Architecture`, `Filename`, `Size`, and a
   supported checksum, and keep only configured architectures plus `all`.
 - Parse source package entries from `Sources.*` and mirror the referenced
@@ -743,6 +761,10 @@ Requirements:
   publish step.
 - Pruning runs only after new metadata is visible and must keep every file
   referenced by current metadata.
+- A missing APT by-hash history manifest is reconstructed from locally verified
+  signed metadata. A corrupt manifest disables deletion of unknown by-hash
+  objects for that cycle and is replaced atomically only after a successful
+  publication.
 
 ## Verification Semantics
 
@@ -756,6 +778,10 @@ For APT repositories, verification must confirm:
 
 - Published metadata signatures validate with the configured keyring.
 - Published package indexes match hashes in the verified `Release` metadata.
+- Every current by-hash object advertised by `Acquire-By-Hash: yes` exists as a
+  regular file with the expected size and digest. Missing or corrupt current
+  objects are repaired from the verified local canonical index without fetching
+  new upstream Release metadata or an upstream by-hash URL.
 - Referenced binary, installer, and source payload files exist, or are repaired
   from payload sources.
 - Referenced APT payload files match expected size and strongest supported

@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/torob/mirror-sync/internal/app"
 	"github.com/torob/mirror-sync/internal/config"
+	"github.com/torob/mirror-sync/internal/logging"
 )
 
 func main() {
@@ -22,6 +24,12 @@ func run() int {
 		return 2
 	}
 	cmd := os.Args[1]
+	switch cmd {
+	case "plan", "sync", "verify", "prune", "run":
+	default:
+		fmt.Fprintln(os.Stderr, app.CommandUsage())
+		return 2
+	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	configPath := fs.String("config", "", "configuration file")
@@ -35,7 +43,10 @@ func run() int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	a := app.New(cfg)
+	logger := logging.New(cfg.Logging, os.Stderr)
+	started := time.Now()
+	logger.Info("command started", "command", cmd)
+	a := app.New(cfg, logger)
 	switch cmd {
 	case "plan":
 		err = a.Plan(ctx)
@@ -47,13 +58,15 @@ func run() int {
 		err = a.Prune(ctx)
 	case "run":
 		err = a.Run(ctx)
-	default:
-		fmt.Fprintln(os.Stderr, app.CommandUsage())
-		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if cfg.Logging.Level == "off" {
+			fmt.Fprintln(os.Stderr, err)
+		} else {
+			logger.Error("command failed", "command", cmd, "duration", time.Since(started))
+		}
 		return 1
 	}
+	logger.Info("command completed", "command", cmd, "duration", time.Since(started))
 	return 0
 }

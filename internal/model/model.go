@@ -48,3 +48,21 @@ type RepositoryState struct {
 	ByHashEnabled map[string]bool
 	Packages      map[string]Package
 }
+
+type OperationStats struct {
+	FilesChecked    int
+	FilesReused     int
+	FilesDownloaded int
+	FilesRepaired   int
+	BytesDownloaded int64
+	FilesPruned     int
+}
+
+func (s *OperationStats) Add(other OperationStats) {
+	s.FilesChecked += other.FilesChecked
+	s.FilesReused += other.FilesReused
+	s.FilesDownloaded += other.FilesDownloaded
+	s.FilesRepaired += other.FilesRepaired
+	s.BytesDownloaded += other.BytesDownloaded
+	s.FilesPruned += other.FilesPruned
+}

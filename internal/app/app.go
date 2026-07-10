@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/torob/mirror-sync/internal/apk"
@@ -21,17 +23,31 @@ import (
 type App struct {
 	Config               *config.Config
 	HTTP                 *httpx.Factory
+	Logger               *slog.Logger
 	repoRunnersOverride  func() []repoTask
 	repositoryRetryDelay func(int) time.Duration
+	cycleSequence        atomic.Uint64
 }
 
-func New(cfg *config.Config) *App {
-	return &App{Config: cfg, HTTP: httpx.NewFactory(cfg.Retries(), limit.New(cfg.MaxInFlightRequests()))}
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+func New(cfg *config.Config, logger *slog.Logger) *App {
+	if logger == nil {
+		logger = discardLogger
+	}
+	return &App{
+		Config: cfg,
+		HTTP:   httpx.NewFactory(cfg.Retries(), limit.New(cfg.MaxInFlightRequests()), logger),
+		Logger: logger,
+	}
 }
 
 func (a *App) Plan(ctx context.Context) error {
+	started := time.Now()
+	a.logger().Info("plan started")
 	plans, err := a.collectPlans(ctx)
 	if err != nil {
+		a.logger().Error("plan failed", "duration", time.Since(started), "error", err)
 		return err
 	}
 	for _, p := range plans {
@@ -40,64 +56,72 @@ func (a *App) Plan(ctx context.Context) error {
 			fmt.Printf("  source %s\n", src)
 		}
 	}
+	a.logger().Info("plan completed", "repositories", len(plans), "duration", time.Since(started))
 	return nil
 }
 
 func (a *App) Sync(ctx context.Context) error {
-	return a.eachRepo(ctx, a.Config.Sync.RepositoryRetries, func(ctx context.Context, runner repoRunner) error {
+	return a.syncCycle(ctx, "oneshot")
+}
+
+func (a *App) syncCycle(ctx context.Context, trigger string) error {
+	cycle := a.cycleSequence.Add(1)
+	return a.runRepositories(ctx, "sync", trigger, cycle, a.Config.Sync.RepositoryRetries, func(ctx context.Context, runner repoRunner) (model.OperationStats, error) {
 		return runner.Sync(ctx)
 	})
 }
 
 func (a *App) Verify(ctx context.Context) error {
-	return a.eachRepo(ctx, 0, func(ctx context.Context, runner repoRunner) error {
+	return a.runRepositories(ctx, "verify", "oneshot", 0, 0, func(ctx context.Context, runner repoRunner) (model.OperationStats, error) {
 		return runner.Verify(ctx)
 	})
 }
 
 func (a *App) Prune(ctx context.Context) error {
-	return a.eachRepo(ctx, 0, func(ctx context.Context, runner repoRunner) error {
+	return a.runRepositories(ctx, "prune", "oneshot", 0, 0, func(ctx context.Context, runner repoRunner) (model.OperationStats, error) {
 		removed, err := runner.Prune(ctx)
 		for _, rel := range removed {
 			fmt.Printf("pruned %s\n", rel)
 		}
-		return err
+		return model.OperationStats{FilesPruned: len(removed)}, err
 	})
 }
 
 func (a *App) Run(ctx context.Context) error {
 	if a.Config.Sync.Schedule.Interval == "" && a.Config.Sync.Schedule.Cron == "" {
-		return fmt.Errorf("run requires sync.schedule.interval or sync.schedule.cron")
+		err := fmt.Errorf("run requires sync.schedule.interval or sync.schedule.cron")
+		a.logger().Error("scheduler failed", "error", err)
+		return err
 	}
-	fmt.Fprintln(os.Stderr, "starting immediate sync")
-	if err := a.Sync(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "startup sync failed: %v\n", err)
-	}
+	a.logger().Info("scheduler started")
+	_ = a.syncCycle(ctx, "startup")
 	next, err := scheduler.New(a.Config.Sync.Schedule)
 	if err != nil {
+		a.logger().Error("scheduler failed", "error", err)
 		return err
 	}
 	for {
-		wait := time.Until(next.Next(time.Now()))
+		nextRun := next.Next(time.Now())
+		wait := time.Until(nextRun)
 		if wait < 0 {
 			wait = 0
 		}
+		a.logger().Info("scheduler waiting", "next_run", nextRun.UTC(), "wait", wait)
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			a.logger().Info("scheduler stopped", "reason", ctx.Err())
 			return nil
 		case <-timer.C:
 		}
-		if err := a.Sync(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "scheduled sync failed: %v\n", err)
-		}
+		_ = a.syncCycle(ctx, "scheduled")
 	}
 }
 
 type repoRunner interface {
-	Sync(context.Context) error
-	Verify(context.Context) error
+	Sync(context.Context) (model.OperationStats, error)
+	Verify(context.Context) (model.OperationStats, error)
 	Prune(context.Context) ([]string, error)
 }
 
@@ -108,6 +132,12 @@ type planRunner interface {
 type repoTask struct {
 	label  string
 	runner repoRunner
+}
+
+type repositoryResults struct {
+	stats     model.OperationStats
+	succeeded int
+	failed    int
 }
 
 func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) {
@@ -122,47 +152,124 @@ func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) 
 	return plans, nil
 }
 
-func (a *App) eachRepo(ctx context.Context, retries int, fn func(context.Context, repoRunner) error) error {
+func (a *App) runRepositories(ctx context.Context, operation, trigger string, cycle uint64, retries int, fn func(context.Context, repoRunner) (model.OperationStats, error)) error {
+	started := time.Now()
 	runners := a.repoRunners()
+	fields := []any{"operation", operation, "trigger", trigger, "repositories", len(runners)}
+	if cycle > 0 {
+		fields = append(fields, "cycle", cycle)
+	}
+	a.logger().Info("operation started", fields...)
+	results, err := a.eachRepo(ctx, operation, cycle, runners, retries, fn)
+	fields = append(fields,
+		"repositories_succeeded", results.succeeded,
+		"repositories_failed", results.failed,
+		"duration", time.Since(started),
+	)
+	fields = append(fields, statsFields(results.stats)...)
+	if err != nil {
+		a.logger().Error("operation failed", fields...)
+	} else {
+		a.logger().Info("operation completed", fields...)
+	}
+	return err
+}
+
+func (a *App) eachRepo(ctx context.Context, operation string, cycle uint64, runners []repoTask, retries int, fn func(context.Context, repoRunner) (model.OperationStats, error)) (repositoryResults, error) {
 	errs := make([]error, len(runners))
+	stats := make([]model.OperationStats, len(runners))
 	var wg sync.WaitGroup
 	for i, task := range runners {
 		i, task := i, task
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = a.runRepoWithRetries(ctx, task, retries, fn)
+			stats[i], errs[i] = a.runRepoWithRetries(ctx, operation, cycle, task, retries, fn)
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	var results repositoryResults
+	for i, err := range errs {
+		results.stats.Add(stats[i])
+		if err == nil {
+			results.succeeded++
+		} else {
+			results.failed++
+		}
+	}
+	return results, errors.Join(errs...)
 }
 
-func (a *App) runRepoWithRetries(ctx context.Context, task repoTask, retries int, fn func(context.Context, repoRunner) error) error {
+func (a *App) runRepoWithRetries(ctx context.Context, operation string, cycle uint64, task repoTask, retries int, fn func(context.Context, repoRunner) (model.OperationStats, error)) (model.OperationStats, error) {
+	var total model.OperationStats
 	label := task.label
 	if label == "" {
 		label = "repository"
 	}
 	for attempt := 0; attempt <= retries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%s: %w", label, err)
+			fields := append(repositoryFields(operation, label, cycle), "attempt", attempt+1, "error", err)
+			a.logger().Error("repository failed", fields...)
+			return total, fmt.Errorf("%s: %w", label, err)
 		}
-		err := fn(ctx, task.runner)
+		attemptStarted := time.Now()
+		baseFields := repositoryFields(operation, label, cycle)
+		a.logger().Info("repository attempt started", append(baseFields, "attempt", attempt+1, "max_attempts", retries+1)...)
+		stats, err := fn(ctx, task.runner)
+		total.Add(stats)
 		if err == nil {
-			return nil
+			fields := append(baseFields, "attempt", attempt+1, "duration", time.Since(attemptStarted))
+			fields = append(fields, statsFields(stats)...)
+			a.logger().Info("repository attempt completed", fields...)
+			return total, nil
 		}
 		if ctx.Err() != nil || attempt == retries {
-			return fmt.Errorf("%s: %w", label, err)
+			fields := append(baseFields, "attempt", attempt+1, "duration", time.Since(attemptStarted), "error", err)
+			fields = append(fields, statsFields(stats)...)
+			a.logger().Error("repository failed", fields...)
+			return total, fmt.Errorf("%s: %w", label, err)
 		}
-		timer := time.NewTimer(a.repoRetryDelay(attempt + 1))
+		delay := a.repoRetryDelay(attempt + 1)
+		retryFields := append(baseFields, "attempt", attempt+1, "next_attempt", attempt+2, "delay", delay, "error", err)
+		a.logger().Warn("repository attempt failed; retrying", retryFields...)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("%s: %w", label, errors.Join(err, ctx.Err()))
+			joined := errors.Join(err, ctx.Err())
+			fields := append(repositoryFields(operation, label, cycle), "attempt", attempt+1, "error", joined)
+			a.logger().Error("repository failed", fields...)
+			return total, fmt.Errorf("%s: %w", label, joined)
 		case <-timer.C:
 		}
 	}
-	return nil
+	return total, nil
+}
+
+func repositoryFields(operation, repository string, cycle uint64) []any {
+	fields := []any{"operation", operation, "repository", repository}
+	if cycle > 0 {
+		fields = append(fields, "cycle", cycle)
+	}
+	return fields
+}
+
+func (a *App) logger() *slog.Logger {
+	if a.Logger == nil {
+		return discardLogger
+	}
+	return a.Logger
+}
+
+func statsFields(stats model.OperationStats) []any {
+	return []any{
+		"files_checked", stats.FilesChecked,
+		"files_reused", stats.FilesReused,
+		"files_downloaded", stats.FilesDownloaded,
+		"files_repaired", stats.FilesRepaired,
+		"bytes_downloaded", stats.BytesDownloaded,
+		"files_pruned", stats.FilesPruned,
+	}
 }
 
 func (a *App) repoRetryDelay(retry int) time.Duration {

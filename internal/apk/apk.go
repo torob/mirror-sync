@@ -49,51 +49,58 @@ func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
 	}, nil
 }
 
-func (r *Runner) Sync(ctx context.Context) error {
+func (r *Runner) Sync(ctx context.Context) (model.OperationStats, error) {
+	var stats model.OperationStats
 	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apk", r.Repo.Name)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer lock.Close()
 	state, err := r.fetchState(ctx)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	clients, err := r.payloadClients()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state)); err != nil {
-		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
+	downloadStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state))
+	stats.Add(downloadStats)
+	if err != nil {
+		return stats, fmt.Errorf("apk %s: %w", r.Repo.Name, err)
 	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), state.Metadata); err != nil {
-		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apk %s: %w", r.Repo.Name, err)
 	}
 	if r.Config.Sync.Prune {
-		_, err := r.Prune(ctx)
-		return err
+		removed, err := r.Prune(ctx)
+		stats.FilesPruned += len(removed)
+		return stats, err
 	}
-	return nil
+	return stats, nil
 }
 
-func (r *Runner) Verify(ctx context.Context) error {
+func (r *Runner) Verify(ctx context.Context) (model.OperationStats, error) {
+	var stats model.OperationStats
 	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apk", r.Repo.Name)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer lock.Close()
 	state, err := r.readPublishedState()
 	if err != nil {
-		return err
+		return stats, err
 	}
 	clients, err := r.payloadClients()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state)); err != nil {
-		return fmt.Errorf("apk %s: %w", r.Repo.Name, err)
+	downloadStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apk", r.Repo.Name), clients, apkExpected(state))
+	stats.Add(downloadStats)
+	if err != nil {
+		return stats, fmt.Errorf("apk %s: %w", r.Repo.Name, err)
 	}
-	return nil
+	return stats, nil
 }
 
 func (r *Runner) Prune(ctx context.Context) ([]string, error) {

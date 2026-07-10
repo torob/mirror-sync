@@ -62,10 +62,11 @@ func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
 	}, nil
 }
 
-func (r *Runner) Sync(ctx context.Context) error {
+func (r *Runner) Sync(ctx context.Context) (model.OperationStats, error) {
+	var stats model.OperationStats
 	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apt", r.Repo.Name)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer lock.Close()
 	oldState, oldPublished, err := r.readPublishedReleaseStateOptional()
@@ -75,71 +76,79 @@ func (r *Runner) Sync(ctx context.Context) error {
 	}
 	history, historyStatus, err := r.loadByHashHistory()
 	if err != nil {
-		return fmt.Errorf("apt %s read by-hash history: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apt %s read by-hash history: %w", r.Repo.Name, err)
 	}
 	if oldPublished {
 		history = updateByHashHistory(history, oldState)
 	}
 	state, err := r.fetchState(ctx)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	if oldPublished {
 		r.preserveByHash(oldState.ByHashFiles)
 	}
 	clients, err := r.payloadClients()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state)); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	downloadStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptExpected(state))
+	stats.Add(downloadStats)
+	if err != nil {
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if err := r.materializeByHash(state.ByHashFiles); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if err := publish.PublishMetadata(r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), state.Metadata); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	history = updateByHashHistory(history, state)
 	if err := r.writeByHashHistory(history); err != nil {
-		return fmt.Errorf("apt %s write by-hash history: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apt %s write by-hash history: %w", r.Repo.Name, err)
 	}
 	if r.Config.Sync.Prune {
-		_, err := r.pruneStateWithHistory(state, history, historyStatus == byHashHistoryCorrupt || oldStateUnsafe)
-		return err
+		removed, err := r.pruneStateWithHistory(state, history, historyStatus == byHashHistoryCorrupt || oldStateUnsafe)
+		stats.FilesPruned += len(removed)
+		return stats, err
 	}
-	return nil
+	return stats, nil
 }
 
-func (r *Runner) Verify(ctx context.Context) error {
+func (r *Runner) Verify(ctx context.Context) (model.OperationStats, error) {
+	var stats model.OperationStats
 	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apt", r.Repo.Name)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer lock.Close()
 	releaseState, err := r.readPublishedReleaseState()
 	if err != nil {
-		return err
+		return stats, err
 	}
 	clients, err := r.payloadClients()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(releaseState.Files)); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	fileStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(releaseState.Files))
+	stats.Add(fileStats)
+	if err != nil {
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	if err := r.materializeByHash(releaseState.ByHashFiles); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
 	r.verifyHistoricByHash()
 	state, err := r.readPublishedState()
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages)); err != nil {
-		return fmt.Errorf("apt %s: %w", r.Repo.Name, err)
+	packageStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
+	stats.Add(packageStats)
+	if err != nil {
+		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
-	return nil
+	return stats, nil
 }
 
 func (r *Runner) Prune(ctx context.Context) ([]string, error) {

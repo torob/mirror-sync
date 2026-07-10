@@ -19,11 +19,16 @@ const DefaultMaxConnectionsPerSource = 4
 
 type Config struct {
 	Version   int        `yaml:"version"`
+	Logging   Logging    `yaml:"logging"`
 	Storage   Storage    `yaml:"storage"`
 	Sync      Sync       `yaml:"sync"`
 	APT       APTSection `yaml:"apt"`
 	APK       APKSection `yaml:"apk"`
 	ConfigDir string     `yaml:"-"`
+}
+
+type Logging struct {
+	Level string `yaml:"level"`
 }
 
 type Storage struct {
@@ -269,6 +274,11 @@ func mappingValue(node *yaml.Node, key string) *yaml.Node {
 func (c *Config) validate() error {
 	if c.Version != 1 {
 		return fmt.Errorf("version must be 1")
+	}
+	switch c.Logging.Level {
+	case "", "debug", "info", "warn", "error", "off":
+	default:
+		return fmt.Errorf("logging.level must be one of debug, info, warn, error, or off")
 	}
 	var err error
 	c.Storage.Published, err = resolvePath(c.ConfigDir, c.Storage.Published)

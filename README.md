@@ -18,6 +18,23 @@ mirrorsync run    -config config.yaml
 
 See `spec.md` and `config.test.yaml` for the supported configuration format.
 
+## Logging
+
+Operational logs are written to stderr as human-readable key/value text. The
+default level is `info`; configure `debug`, `info`, `warn`, `error`, or `off`
+in YAML:
+
+```yaml
+logging:
+  level: info
+```
+
+Command results such as `plan` details and pruned file names remain on stdout.
+Repository completion logs include retry, duration, download, reuse, repair,
+byte, and prune counters. Source and proxy values in logs are limited to their
+hosts. The `off` level suppresses lifecycle records; a fatal command error is
+still written as a plain stderr diagnostic.
+
 ## Build
 
 ```bash

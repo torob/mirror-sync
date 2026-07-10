@@ -1,8 +1,10 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,40 @@ import (
 	"github.com/torob/mirror-sync/internal/config"
 	"github.com/torob/mirror-sync/internal/limit"
 )
+
+func TestRequestErrorsAndRetryLogsRedactURLCredentialsAndQuery(t *testing.T) {
+	oldBackoff := retryBackoff
+	retryBackoff = func(int) time.Duration { return 0 }
+	defer func() { retryBackoff = oldBackoff }()
+
+	var logs bytes.Buffer
+	factory := NewFactory(1, limit.New(1), slog.New(slog.NewTextHandler(&logs, nil)))
+	client, err := factory.Client(config.EffectiveSource{
+		RepoName:            "repo",
+		URL:                 "http://user:source-secret@127.0.0.1:1/base?token=query-secret",
+		ProxyURL:            "http://proxy-user:proxy-secret@127.0.0.1:2",
+		MaxConnections:      1,
+		MaxInFlightRequests: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetBytes(context.Background(), "pool/a.deb", 1024)
+	if err == nil {
+		t.Fatal("GetBytes succeeded, want connection failure")
+	}
+	combined := err.Error() + logs.String()
+	for _, secret := range []string{"source-secret", "proxy-secret", "query-secret", "user:", "proxy-user:"} {
+		if strings.Contains(combined, secret) {
+			t.Fatalf("output exposed %q: %s", secret, combined)
+		}
+	}
+	for _, want := range []string{"source_host=127.0.0.1:1", "proxy_host=127.0.0.1:2", "path=pool/a.deb", "retrying"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("retry log does not contain %q: %s", want, logs.String())
+		}
+	}
+}
 
 func TestClientRetriesHTTPFailuresBeforeSuccess(t *testing.T) {
 	oldBackoff := retryBackoff

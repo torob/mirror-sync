@@ -132,10 +132,13 @@ scheduler.
 ## Configuration
 
 Configuration is YAML with a required `version` field and optional top-level
-`apt` and `apk` sections.
+`logging`, `apt`, and `apk` sections.
 
 ```yaml
 version: 1
+
+logging:
+  level: info
 
 storage:
   published: /srv/mirrors
@@ -203,6 +206,14 @@ apk:
 ### Configuration Rules
 
 - `version` must be `1`.
+- `logging.level` may be `debug`, `info`, `warn`, `error`, or `off` and
+  defaults to `info` when omitted. `off` suppresses lifecycle records but not
+  the final stderr diagnostic for a failed command.
+- Operational logs are human-readable key/value text on standard error;
+  command result output remains on standard output.
+- Lifecycle logs report commands, sync cycles, repository attempts, retries,
+  durations, outcomes, and aggregate payload operation counters. They identify
+  network sources and proxies by host only.
 - `storage.published` is the served mirror root.
 - `storage.staging` is used for temporary downloads and must not be inside a
   client-visible repository path unless it is hidden from clients.

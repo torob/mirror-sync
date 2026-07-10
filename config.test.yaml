@@ -1,5 +1,8 @@
 version: 1
 
+logging:
+  level: info
+
 storage:
   published: .e2e/repos
   staging: .e2e/staged

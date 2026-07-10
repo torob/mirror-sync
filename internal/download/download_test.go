@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func TestEnsureManyDownloadsConcurrentlyWithinGlobalLimit(t *testing.T) {
 	client := testClient(t, server.URL, 2, 10)
 	root := t.TempDir()
 	staging := t.TempDir()
-	if err := EnsureRepaired(context.Background(), root, staging, []*httpx.Client{client}, testExpected(data)); err != nil {
+	if _, err := EnsureRepaired(context.Background(), root, staging, []*httpx.Client{client}, testExpected(data)); err != nil {
 		t.Fatal(err)
 	}
 	for rel, body := range data {
@@ -110,7 +111,7 @@ func TestEnsureManyHonorsPerSourceLimit(t *testing.T) {
 	defer server.Close()
 
 	client := testClient(t, server.URL, 10, 1)
-	if err := EnsureRepaired(context.Background(), t.TempDir(), t.TempDir(), []*httpx.Client{client}, testExpected(data)); err != nil {
+	if _, err := EnsureRepaired(context.Background(), t.TempDir(), t.TempDir(), []*httpx.Client{client}, testExpected(data)); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -139,7 +140,7 @@ func TestEnsureManyFallsBackSourcesInOrder(t *testing.T) {
 		testClient(t, second.URL, 10, 10),
 	}
 	root := t.TempDir()
-	if err := EnsureRepaired(context.Background(), root, t.TempDir(), clients, testExpected(data)); err != nil {
+	if _, err := EnsureRepaired(context.Background(), root, t.TempDir(), clients, testExpected(data)); err != nil {
 		t.Fatal(err)
 	}
 	if firstHits != 1 || secondHits != 1 {
@@ -187,7 +188,7 @@ func TestEnsureManyCanMaterializeExpectedFileFromGzipSource(t *testing.T) {
 		},
 	}
 	root := t.TempDir()
-	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "dists", "suite", "main", "dep11", "icons-48x48.tar"))
@@ -218,7 +219,7 @@ func TestEnsureSyncedPublishesReadablePayloadAndDirectoriesWithRestrictiveUmask(
 	defer server.Close()
 
 	root := t.TempDir()
-	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(data)); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(data)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -247,7 +248,7 @@ func TestEnsureSyncedReusesExistingPayloadWithoutRepairingMode(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
 		t.Fatal(err)
 	}
 	if hits != 0 {
@@ -280,7 +281,7 @@ func TestEnsureSizeOnlyReusesMatchingSizePayloadWithoutVerification(t *testing.T
 		calledVerify = true
 		return fmt.Errorf("unexpected verification")
 	}
-	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
 		t.Fatal(err)
 	}
 	if calledVerify {
@@ -316,7 +317,7 @@ func TestEnsureSizeOnlyDownloadsWrongSizePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "pool/a.deb"))
@@ -350,7 +351,7 @@ func TestEnsureSizeOnlyIgnoresStagedPayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := EnsureSynced(context.Background(), root, staging, []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
+	if _, err := EnsureSynced(context.Background(), root, staging, []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
 		t.Fatal(err)
 	}
 	if hits != 1 {
@@ -382,7 +383,7 @@ func TestEnsureRepairReplacesSameSizeCorruptedPayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := EnsureRepaired(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
+	if _, err := EnsureRepaired(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, testExpected(map[string][]byte{"pool/a.deb": good})); err != nil {
 		t.Fatal(err)
 	}
 	if hits != 1 {
@@ -430,7 +431,7 @@ func TestEnsureRepairReplacesPayloadRejectedByVerifier(t *testing.T) {
 			return nil
 		},
 	}
-	if err := EnsureRepaired(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
+	if _, err := EnsureRepaired(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 1, 1)}, []Expected{exp}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "pool/a.apk"))
@@ -458,6 +459,60 @@ func TestWorkerCountIsBoundedBySourceCapacityAndExpected(t *testing.T) {
 	}
 	if got := workerCount(clients, 0); got != 0 {
 		t.Fatalf("workerCount without expected packages = %d, want 0", got)
+	}
+}
+
+func TestEnsureSyncedReportsDownloadedAndReusedPayloads(t *testing.T) {
+	data := map[string][]byte{
+		"pool/reused.deb":     []byte("already-present"),
+		"pool/downloaded.deb": []byte("downloaded"),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := data[strings.TrimPrefix(r.URL.Path, "/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pool/reused.deb"), data["pool/reused.deb"], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := EnsureSynced(context.Background(), root, t.TempDir(), []*httpx.Client{testClient(t, server.URL, 2, 2)}, testExpected(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesChecked != 2 || stats.FilesReused != 1 || stats.FilesDownloaded != 1 {
+		t.Fatalf("stats = %+v, want checked=2 reused=1 downloaded=1", stats)
+	}
+	if stats.BytesDownloaded != int64(len(data["pool/downloaded.deb"])) {
+		t.Fatalf("downloaded bytes = %d, want %d", stats.BytesDownloaded, len(data["pool/downloaded.deb"]))
+	}
+}
+
+func TestEnsureRepairedReportsStagedRepairWithoutDownload(t *testing.T) {
+	good := []byte("package-a")
+	root := t.TempDir()
+	staging := t.TempDir()
+	staged := filepath.Join(staging, "payloads", "pool/a.deb")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := EnsureRepaired(context.Background(), root, staging, nil, testExpected(map[string][]byte{"pool/a.deb": good}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesChecked != 1 || stats.FilesRepaired != 1 || stats.FilesDownloaded != 0 || stats.BytesDownloaded != 0 {
+		t.Fatalf("stats = %+v, want one staged repair without download", stats)
 	}
 }
 

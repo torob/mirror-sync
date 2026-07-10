@@ -15,11 +15,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/ulikunitz/xz"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/torob/mirror-sync/internal/httpx"
+	"github.com/torob/mirror-sync/internal/model"
 	"github.com/torob/mirror-sync/internal/publish"
 	"github.com/torob/mirror-sync/internal/safe"
 )
@@ -39,28 +41,34 @@ type Expected struct {
 	Sources      []Source
 }
 
-type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expected) error
+type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expected) (model.OperationStats, error)
 
-func EnsureSynced(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+func EnsureSynced(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) (model.OperationStats, error) {
 	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureSyncedOne)
 }
 
-func EnsureRepaired(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) error {
+func EnsureRepaired(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected) (model.OperationStats, error) {
 	return ensureMany(ctx, publishRoot, stagingRoot, clients, expected, ensureRepairedOne)
 }
 
-func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected, ensureOne ensureOneFunc) error {
+func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected []Expected, ensureOne ensureOneFunc) (model.OperationStats, error) {
 	workers := workerCount(clients, len(expected))
 	if workers == 0 {
-		return nil
+		return model.OperationStats{}, nil
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	jobs := make(chan Expected)
+	var stats model.OperationStats
+	var statsMu sync.Mutex
 	for i := 0; i < workers; i++ {
 		g.Go(func() error {
 			for exp := range jobs {
-				if err := ensureOne(ctx, publishRoot, stagingRoot, clients, exp); err != nil {
+				result, err := ensureOne(ctx, publishRoot, stagingRoot, clients, exp)
+				statsMu.Lock()
+				stats.Add(result)
+				statsMu.Unlock()
+				if err != nil {
 					return fmt.Errorf("file %s: %w", exp.RelPath, err)
 				}
 			}
@@ -73,11 +81,13 @@ func ensureMany(ctx context.Context, publishRoot, stagingRoot string, clients []
 		case jobs <- exp:
 		case <-ctx.Done():
 			close(jobs)
-			return g.Wait()
+			err := g.Wait()
+			return stats, err
 		}
 	}
 	close(jobs)
-	return g.Wait()
+	err := g.Wait()
+	return stats, err
 }
 
 func workerCount(clients []*httpx.Client, expected int) int {
@@ -101,79 +111,102 @@ func workerCount(clients []*httpx.Client, expected int) int {
 	return workers
 }
 
-func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
+func ensureSyncedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) (model.OperationStats, error) {
+	stats := model.OperationStats{FilesChecked: 1}
 	final, err := safe.Join(publishRoot, expected.RelPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	options := []publish.VerifyOption{publish.WithSize(expected.Size)}
 	if expected.VerifyOnSync {
 		options = append(options, checksumVerifyOption(expected), publish.WithCheck(expected.Verify))
 	}
 	if ok, err := publish.Verify(final, options...); err != nil {
-		return err
+		return stats, err
 	} else if ok {
-		return nil
+		stats.FilesReused = 1
+		return stats, nil
 	}
 	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), expected.RelPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	os.Remove(staged)
-	return downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
+	bytes, err := downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
+	if err == nil {
+		stats.FilesDownloaded = 1
+		stats.BytesDownloaded = bytes
+	}
+	return stats, err
 }
 
-func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) error {
+func ensureRepairedOne(ctx context.Context, publishRoot, stagingRoot string, clients []*httpx.Client, expected Expected) (model.OperationStats, error) {
+	stats := model.OperationStats{FilesChecked: 1}
 	final, err := safe.Join(publishRoot, expected.RelPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	if ok, err := publish.Verify(final,
 		publish.WithSize(expected.Size),
 		checksumVerifyOption(expected),
 		publish.WithCheck(expected.Verify),
 	); err != nil {
-		return err
+		return stats, err
 	} else if ok {
-		return nil
+		stats.FilesReused = 1
+		return stats, nil
 	}
 	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), expected.RelPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	if ok, err := publish.Verify(staged,
 		publish.WithSize(expected.Size),
 		checksumVerifyOption(expected),
 		publish.WithCheck(expected.Verify),
 	); err != nil {
-		return err
+		return stats, err
 	} else if ok {
-		return publish.PublishFile(publishRoot, staged, final)
+		err := publish.PublishFile(publishRoot, staged, final)
+		if err == nil {
+			stats.FilesRepaired = 1
+		}
+		return stats, err
 	}
 	os.Remove(staged)
-	return downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
+	bytes, err := downloadAndPublish(ctx, publishRoot, clients, expected, staged, final)
+	if err == nil {
+		stats.FilesDownloaded = 1
+		stats.FilesRepaired = 1
+		stats.BytesDownloaded = bytes
+	}
+	return stats, err
 }
 
-func downloadAndPublish(ctx context.Context, publishRoot string, clients []*httpx.Client, expected Expected, staged, final string) error {
+func downloadAndPublish(ctx context.Context, publishRoot string, clients []*httpx.Client, expected Expected, staged, final string) (int64, error) {
 	var failures []string
 	for _, client := range clients {
-		if err := downloadFromClient(ctx, client, expected, staged); err != nil {
+		written, err := downloadFromClient(ctx, client, expected, staged)
+		if err != nil {
 			failures = append(failures, err.Error())
 			continue
 		}
 		if expected.Verify != nil {
 			if err := expected.Verify(staged); err != nil {
 				os.Remove(staged)
-				failures = append(failures, fmt.Sprintf("%s verification: %v", client.URL(expected.RelPath), err))
+				failures = append(failures, fmt.Sprintf("source %s file %s verification: %v", client.Host(), expected.RelPath, err))
 				continue
 			}
 		}
-		return publish.PublishFile(publishRoot, staged, final)
+		if err := publish.PublishFile(publishRoot, staged, final); err != nil {
+			return 0, err
+		}
+		return written, nil
 	}
-	return fmt.Errorf("all sources failed for %s: %s", expected.RelPath, strings.Join(failures, "; "))
+	return 0, fmt.Errorf("all sources failed for %s: %s", expected.RelPath, strings.Join(failures, "; "))
 }
 
-func downloadFromClient(ctx context.Context, client *httpx.Client, expected Expected, staged string) error {
+func downloadFromClient(ctx context.Context, client *httpx.Client, expected Expected, staged string) (int64, error) {
 	var failures []string
 	sources := expected.Sources
 	if len(sources) == 0 {
@@ -183,18 +216,19 @@ func downloadFromClient(ctx context.Context, client *httpx.Client, expected Expe
 		if source.RelPath == "" {
 			source.RelPath = expected.RelPath
 		}
-		if err := downloadOne(ctx, client, expected, source, staged); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", client.URL(source.RelPath), err))
+		written, err := downloadOne(ctx, client, expected, source, staged)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("source %s file %s: %v", client.Host(), source.RelPath, err))
 			continue
 		}
-		return nil
+		return written, nil
 	}
-	return fmt.Errorf("%s", strings.Join(failures, "; "))
+	return 0, fmt.Errorf("%s", strings.Join(failures, "; "))
 }
 
-func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, source Source, staged string) error {
+func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, source Source, staged string) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(staged), 0o755); err != nil {
-		return err
+		return 0, err
 	}
 	tmp := staged + ".partial"
 	os.Remove(tmp)
@@ -238,23 +272,23 @@ func downloadOne(ctx context.Context, client *httpx.Client, expected Expected, s
 	})
 	if err != nil {
 		os.Remove(tmp)
-		return err
+		return 0, err
 	}
 	if expected.Size >= 0 && written != expected.Size {
 		os.Remove(tmp)
-		return fmt.Errorf("size mismatch got %d want %d", written, expected.Size)
+		return 0, fmt.Errorf("size mismatch got %d want %d", written, expected.Size)
 	}
 	if checksumAlg != "" {
 		if !strings.EqualFold(gotChecksum, checksumHex) {
 			os.Remove(tmp)
-			return fmt.Errorf("%s mismatch got %s want %s", strings.ToLower(checksumAlg), gotChecksum, checksumHex)
+			return 0, fmt.Errorf("%s mismatch got %s want %s", strings.ToLower(checksumAlg), gotChecksum, checksumHex)
 		}
 	}
 	if err := os.Rename(tmp, staged); err != nil {
 		os.Remove(tmp)
-		return err
+		return 0, err
 	}
-	return nil
+	return written, nil
 }
 
 func checksumVerifyOption(expected Expected) publish.VerifyOption {

@@ -7,6 +7,27 @@ import (
 	"testing"
 )
 
+func TestLoggingLevelValidation(t *testing.T) {
+	for _, level := range []string{"", "debug", "info", "warn", "error", "off"} {
+		t.Run("accepted_"+level, func(t *testing.T) {
+			cfg := &Config{
+				Version:   1,
+				Logging:   Logging{Level: level},
+				ConfigDir: t.TempDir(),
+				Storage:   Storage{Published: "repos", Staging: "staged"},
+			}
+			if err := cfg.validate(); err != nil {
+				t.Fatalf("validate logging level %q: %v", level, err)
+			}
+		})
+	}
+
+	cfg := &Config{Version: 1, Logging: Logging{Level: "trace"}}
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "logging.level") {
+		t.Fatalf("validate invalid logging level = %v, want logging.level error", err)
+	}
+}
+
 func TestLoadRejectsDuplicateResolvedPublishPaths(t *testing.T) {
 	dir := t.TempDir()
 	key := filepath.Join(dir, "key.gpg")

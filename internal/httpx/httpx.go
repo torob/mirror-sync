@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ type Factory struct {
 	clients       map[string]*Client
 	retries       int
 	globalLimiter *limit.Limiter
+	logger        *slog.Logger
 }
 
 type Client struct {
@@ -30,6 +32,7 @@ type Client struct {
 	sourceLimiter *limit.Limiter
 	globalLimiter *limit.Limiter
 	retries       int
+	logger        *slog.Logger
 }
 
 // StatusError reports a non-successful HTTP response. Callers may use IsStatus
@@ -37,13 +40,14 @@ type Client struct {
 // failures without parsing the error text.
 type StatusError struct {
 	RepoName   string
-	URL        string
+	SourceHost string
+	Path       string
 	Status     string
 	StatusCode int
 }
 
 func (e *StatusError) Error() string {
-	return fmt.Sprintf("%s request %s returned %s", e.RepoName, e.URL, e.Status)
+	return fmt.Sprintf("%s request source %s file %s returned %s", e.RepoName, e.SourceHost, e.Path, e.Status)
 }
 
 func IsStatus(err error, statusCode int) bool {
@@ -55,8 +59,12 @@ var retryBackoff = func(attempt int) time.Duration {
 	return time.Duration(attempt) * time.Second
 }
 
-func NewFactory(retries int, globalLimiter *limit.Limiter) *Factory {
-	return &Factory{clients: map[string]*Client{}, retries: retries, globalLimiter: globalLimiter}
+func NewFactory(retries int, globalLimiter *limit.Limiter, loggers ...*slog.Logger) *Factory {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	return &Factory{clients: map[string]*Client{}, retries: retries, globalLimiter: globalLimiter, logger: logger}
 }
 
 func (f *Factory) Client(src config.EffectiveSource) (*Client, error) {
@@ -79,6 +87,7 @@ func (f *Factory) Client(src config.EffectiveSource) (*Client, error) {
 		sourceLimiter: limit.New(src.MaxInFlightRequests),
 		globalLimiter: f.globalLimiter,
 		retries:       f.retries,
+		logger:        f.logger,
 	}
 	f.clients[key] = c
 	return c, nil
@@ -111,6 +120,25 @@ func transport(src config.EffectiveSource) (*http.Transport, error) {
 
 func (c *Client) URL(rel string) string {
 	return c.source.URL + "/" + strings.TrimLeft(rel, "/")
+}
+
+func (c *Client) Host() string {
+	u, err := url.Parse(c.source.URL)
+	if err != nil || u.Host == "" {
+		return "unknown"
+	}
+	return u.Host
+}
+
+func (c *Client) ProxyHost() string {
+	if c.source.DirectProxy || c.source.ProxyURL == "" {
+		return "direct"
+	}
+	u, err := url.Parse(c.source.ProxyURL)
+	if err != nil || u.Host == "" {
+		return "unknown"
+	}
+	return u.Host
 }
 
 func (c *Client) GetBytes(ctx context.Context, rel string, maxBytes int64) ([]byte, error) {
@@ -151,7 +179,7 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 		if err != nil {
 			releaseGlobal()
 			releaseSource()
-			last = fmt.Errorf("%s request %s via %s failed: %w", c.source.RepoName, url, c.ProxyMode(), err)
+			last = fmt.Errorf("%s request source %s file %s via %s failed: %w", c.source.RepoName, c.Host(), strings.TrimLeft(rel, "/"), c.ProxyHost(), transportCause(err))
 		} else {
 			err = func() error {
 				defer releaseSource()
@@ -160,7 +188,7 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 					io.Copy(io.Discard, resp.Body)
 					return &StatusError{
-						RepoName: c.source.RepoName, URL: url,
+						RepoName: c.source.RepoName, SourceHost: c.Host(), Path: strings.TrimLeft(rel, "/"),
 						Status: resp.Status, StatusCode: resp.StatusCode,
 					}
 				}
@@ -172,14 +200,35 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 			last = err
 		}
 		if attempt < c.retries {
+			delay := retryBackoff(attempt + 1)
+			c.logger.Warn("HTTP request failed; retrying",
+				"repository", c.source.RepoName,
+				"source_host", c.Host(),
+				"path", strings.TrimLeft(rel, "/"),
+				"proxy_host", c.ProxyHost(),
+				"attempt", attempt+1,
+				"next_attempt", attempt+2,
+				"delay", delay,
+				"error", last,
+			)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
-			case <-time.After(retryBackoff(attempt + 1)):
+			case <-timer.C:
 			}
 		}
 	}
 	return last
+}
+
+func transportCause(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
 }
 
 func (c *Client) ProxyMode() string {

@@ -303,7 +303,7 @@ func TestByHashSyncLifecycle(t *testing.T) {
 	oldSHA256Path, _ := byHashDestination("dists/stable/main/binary-amd64/Packages", "SHA256", current.checksums["SHA256"])
 	for number := 2; number <= 5; number++ {
 		current = makeGeneration(number, true)
-		if err := runner.Sync(context.Background()); err != nil {
+		if _, err := runner.Sync(context.Background()); err != nil {
 			t.Fatalf("generation %d sync: %v", number, err)
 		}
 		if number == 2 {
@@ -335,7 +335,7 @@ func TestByHashSyncLifecycle(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, filepath.FromSlash(currentSHA256Path))); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.Verify(context.Background()); err != nil {
+	if _, err := runner.Verify(context.Background()); err != nil {
 		t.Fatalf("verify repair: %v", err)
 	}
 	if got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(currentSHA256Path))); err != nil || !bytes.Equal(got, current.data) {
@@ -351,14 +351,14 @@ func TestByHashSyncLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	current = makeGeneration(6, true)
-	if err := runner.Sync(context.Background()); err != nil {
+	if _, err := runner.Sync(context.Background()); err != nil {
 		t.Fatalf("corrupt-history sync: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(unknown))); err != nil {
 		t.Fatalf("unknown object was deleted during corrupt-manifest cycle: %v", err)
 	}
 	current = makeGeneration(7, true)
-	if err := runner.Sync(context.Background()); err != nil {
+	if _, err := runner.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(unknown))); !os.IsNotExist(err) {
@@ -366,7 +366,7 @@ func TestByHashSyncLifecycle(t *testing.T) {
 	}
 
 	current = makeGeneration(8, false)
-	if err := runner.Sync(context.Background()); err != nil {
+	if _, err := runner.Sync(context.Background()); err != nil {
 		t.Fatalf("disabled by-hash sync: %v", err)
 	}
 	if paths := existingByHashTestPaths(t, root); len(paths) != 0 {
@@ -419,7 +419,7 @@ func TestSyncLeavesOldSignedMetadataWhenByHashMaterializationFails(t *testing.T)
 		},
 		HTTP: httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests())),
 	}
-	if err := runner.Sync(context.Background()); err == nil || !strings.Contains(err.Error(), "materialize by-hash") {
+	if _, err := runner.Sync(context.Background()); err == nil || !strings.Contains(err.Error(), "materialize by-hash") {
 		t.Fatalf("Sync() error = %v, want by-hash materialization failure", err)
 	}
 	got, err := os.ReadFile(filepath.Join(root, "dists", "stable", "InRelease"))

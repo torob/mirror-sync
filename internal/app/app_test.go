@@ -1,35 +1,39 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/torob/mirror-sync/internal/config"
+	"github.com/torob/mirror-sync/internal/model"
 )
 
 type fakeRunner struct {
-	syncFn   func(context.Context) error
-	verifyFn func(context.Context) error
-	pruneFn  func(context.Context) ([]string, error)
+	syncFn    func(context.Context) error
+	syncStats model.OperationStats
+	verifyFn  func(context.Context) error
+	pruneFn   func(context.Context) ([]string, error)
 }
 
-func (r *fakeRunner) Sync(ctx context.Context) error {
+func (r *fakeRunner) Sync(ctx context.Context) (model.OperationStats, error) {
 	if r.syncFn != nil {
-		return r.syncFn(ctx)
+		return r.syncStats, r.syncFn(ctx)
 	}
-	return nil
+	return r.syncStats, nil
 }
 
-func (r *fakeRunner) Verify(ctx context.Context) error {
+func (r *fakeRunner) Verify(ctx context.Context) (model.OperationStats, error) {
 	if r.verifyFn != nil {
-		return r.verifyFn(ctx)
+		return model.OperationStats{}, r.verifyFn(ctx)
 	}
-	return nil
+	return model.OperationStats{}, nil
 }
 
 func (r *fakeRunner) Prune(ctx context.Context) ([]string, error) {
@@ -222,10 +226,54 @@ func TestRepoRetryDelayIsLinearByDefault(t *testing.T) {
 func TestRunRepoWithRetriesLabelsFinalFailure(t *testing.T) {
 	a := &App{repositoryRetryDelay: func(int) time.Duration { return 0 }}
 	runner := &fakeRunner{syncFn: func(context.Context) error { return fmt.Errorf("failed") }}
-	err := a.runRepoWithRetries(context.Background(), repoTask{label: "apt/ubuntu", runner: runner}, 1, func(ctx context.Context, r repoRunner) error {
+	_, err := a.runRepoWithRetries(context.Background(), "sync", 1, repoTask{label: "apt/ubuntu", runner: runner}, 1, func(ctx context.Context, r repoRunner) (model.OperationStats, error) {
 		return r.Sync(ctx)
 	})
 	if err == nil || !strings.Contains(err.Error(), "apt/ubuntu") {
 		t.Fatalf("error = %v, want labeled failure", err)
+	}
+}
+
+func TestSyncLogsLifecycleAndAccumulatesRetryStats(t *testing.T) {
+	var out bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var calls atomic.Int32
+	a := &App{
+		Config: &config.Config{Sync: config.Sync{RepositoryRetries: 1}},
+		Logger: logger,
+		repoRunnersOverride: func() []repoTask {
+			return []repoTask{{
+				label: "apt/ubuntu",
+				runner: &fakeRunner{
+					syncStats: model.OperationStats{FilesChecked: 1, FilesDownloaded: 1, BytesDownloaded: 10},
+					syncFn: func(context.Context) error {
+						if calls.Add(1) == 1 {
+							return errors.New("temporary")
+						}
+						return nil
+					},
+				},
+			}}
+		},
+		repositoryRetryDelay: func(int) time.Duration { return 0 },
+	}
+	if err := a.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"msg=\"operation started\"",
+		"trigger=oneshot",
+		"cycle=1",
+		"msg=\"repository attempt failed; retrying\"",
+		"repository=apt/ubuntu",
+		"msg=\"operation completed\"",
+		"files_checked=2",
+		"files_downloaded=2",
+		"bytes_downloaded=20",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log output does not contain %q:\n%s", want, got)
+		}
 	}
 }

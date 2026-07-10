@@ -296,8 +296,8 @@ func TestByHashSyncLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repositoryPlan.MetadataFiles != 7 {
-		t.Fatalf("plan metadata files = %d, want InRelease + Release + canonical + four by-hash objects", repositoryPlan.MetadataFiles)
+	if repositoryPlan.MetadataFiles != 6 {
+		t.Fatalf("plan metadata files = %d, want InRelease + canonical + four by-hash objects", repositoryPlan.MetadataFiles)
 	}
 
 	oldSHA256Path, _ := byHashDestination("dists/stable/main/binary-amd64/Packages", "SHA256", current.checksums["SHA256"])

@@ -193,7 +193,9 @@ func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) 
 	inRelease, keyring, _ := signedInRelease(t, release)
 	writePublishedInRelease(t, root, "stable", inRelease)
 	writeTestFile(t, root, "dists/stable/Release", release)
+	writeTestFile(t, root, "dists/stable/Release.gpg", detachedSignature(t, keyring[0], release))
 	writeTestFile(t, root, "dists/stable/main/binary-amd64/Packages", nil)
+	writeTestFile(t, root, "dists/stable/stale", []byte("stale"))
 	runner := &Runner{Repo: config.APTRepository{
 		Name:           "repo",
 		AbsPublishPath: root,
@@ -209,8 +211,24 @@ func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) 
 	if len(state.Packages) != 0 {
 		t.Fatalf("packages = %d, want none", len(state.Packages))
 	}
+	wantMetadata := []string{"dists/stable/InRelease", "dists/stable/Release", "dists/stable/Release.gpg"}
+	if got := metadataPaths(state.Metadata); !reflect.DeepEqual(got, wantMetadata) {
+		t.Fatalf("published metadata = %#v, want %#v", got, wantMetadata)
+	}
 	if data, ok := metadataData(state.Metadata, "dists/stable/Release"); !ok || !bytes.Equal(data, release) {
 		t.Fatalf("published Release metadata = %q, ok %t, want original Release bytes", data, ok)
+	}
+	removed, err := runner.pruneStateWithHistory(state, byHashHistory{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(removed, []string{"dists/stable/stale"}) {
+		t.Fatalf("pruned files = %#v, want stale file only", removed)
+	}
+	for _, rel := range wantMetadata {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+			t.Fatalf("valid metadata %s was not retained: %v", rel, err)
+		}
 	}
 }
 
@@ -294,12 +312,15 @@ SHA512:
 func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
 	release := []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n")
 	inRelease, keyring, plain := signedInRelease(t, release)
+	sig := detachedSignature(t, keyring[0], release)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dists/stable/InRelease":
 			_, _ = w.Write(inRelease)
 		case "/dists/stable/Release":
 			_, _ = w.Write(release)
+		case "/dists/stable/Release.gpg":
+			_, _ = w.Write(sig)
 		default:
 			http.NotFound(w, r)
 		}
@@ -318,7 +339,7 @@ func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
 		t.Fatalf("parsed size = %d, want 0", hashes["main/binary-amd64/Packages"].Size)
 	}
 	got := metadataPaths(metadata)
-	want := []string{"dists/stable/InRelease", "dists/stable/Release"}
+	want := []string{"dists/stable/InRelease", "dists/stable/Release", "dists/stable/Release.gpg"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("metadata paths = %#v, want %#v", got, want)
 	}
@@ -348,14 +369,18 @@ func TestReleaseMatchesVerifiedCleartextCanonicalLineEndings(t *testing.T) {
 	}
 }
 
-func TestFetchReleaseRejectsInconsistentPlainRelease(t *testing.T) {
+func TestFetchReleasePrefersInReleaseWhenDetachedFormDiffers(t *testing.T) {
 	inRelease, keyring, _ := signedInRelease(t, []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n"))
+	detachedRelease := []byte("Origin: different\n")
+	detachedSig := detachedSignature(t, keyring[0], detachedRelease)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/dists/stable/InRelease":
 			_, _ = w.Write(inRelease)
 		case "/dists/stable/Release":
-			_, _ = w.Write([]byte("Origin: different\n"))
+			_, _ = w.Write(detachedRelease)
+		case "/dists/stable/Release.gpg":
+			_, _ = w.Write(detachedSig)
 		default:
 			http.NotFound(w, r)
 		}
@@ -363,13 +388,19 @@ func TestFetchReleaseRejectsInconsistentPlainRelease(t *testing.T) {
 	defer server.Close()
 
 	runner, client := testAPTRunnerAndClient(t, server.URL)
-	_, _, _, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
-	if err == nil || !strings.Contains(err.Error(), "differs from verified") {
-		t.Fatalf("fetchRelease error = %v, want inconsistent Release error", err)
+	_, _, metadata, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := metadataPaths(metadata), []string{"dists/stable/InRelease"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata paths = %#v, want %#v", got, want)
 	}
 }
 
-func TestFetchReleaseRejectsMalformedInReleaseWithoutFallback(t *testing.T) {
+func TestFetchReleaseUsesValidDetachedPairWhenInReleaseMalformed(t *testing.T) {
+	release := []byte("Origin: fallback\n")
+	_, keyring, _ := signedInRelease(t, release)
+	detachedSig := detachedSignature(t, keyring[0], release)
 	releaseHits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -377,7 +408,9 @@ func TestFetchReleaseRejectsMalformedInReleaseWithoutFallback(t *testing.T) {
 			_, _ = w.Write([]byte("unsigned prefix\n-----BEGIN PGP SIGNED MESSAGE-----\n"))
 		case "/dists/stable/Release":
 			releaseHits++
-			_, _ = w.Write([]byte("Origin: fallback\n"))
+			_, _ = w.Write(release)
+		case "/dists/stable/Release.gpg":
+			_, _ = w.Write(detachedSig)
 		default:
 			http.NotFound(w, r)
 		}
@@ -385,13 +418,138 @@ func TestFetchReleaseRejectsMalformedInReleaseWithoutFallback(t *testing.T) {
 	defer server.Close()
 
 	runner, client := testAPTRunnerAndClient(t, server.URL)
-	_, _, _, err := runner.fetchRelease(context.Background(), client, nil, "stable")
-	if err == nil || !strings.Contains(err.Error(), "does not start") {
-		t.Fatalf("fetchRelease error = %v, want malformed InRelease error", err)
+	_, _, metadata, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if releaseHits != 0 {
-		t.Fatalf("Release fallback hits = %d, want 0", releaseHits)
+	if releaseHits != 1 {
+		t.Fatalf("Release hits = %d, want 1", releaseHits)
 	}
+	want := []string{"dists/stable/Release", "dists/stable/Release.gpg"}
+	if got := metadataPaths(metadata); !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata paths = %#v, want %#v", got, want)
+	}
+}
+
+func TestFetchReleaseSignedFormAvailabilityAndFailures(t *testing.T) {
+	release := []byte("Origin: example\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	validSig := detachedSignature(t, keyring[0], release)
+
+	tests := []struct {
+		name      string
+		responses map[string]testHTTPResponse
+		wantPaths []string
+		wantErr   string
+	}{
+		{
+			name:      "only InRelease",
+			responses: map[string]testHTTPResponse{"/dists/stable/InRelease": {data: inRelease}},
+			wantPaths: []string{"dists/stable/InRelease"},
+		},
+		{
+			name: "only detached pair",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/Release":     {data: release},
+				"/dists/stable/Release.gpg": {data: validSig},
+			},
+			wantPaths: []string{"dists/stable/Release", "dists/stable/Release.gpg"},
+		},
+		{
+			name: "partial detached pair with valid InRelease",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease": {data: inRelease},
+				"/dists/stable/Release":   {data: release},
+			},
+			wantPaths: []string{"dists/stable/InRelease"},
+		},
+		{
+			name: "detached Release missing with valid InRelease",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease":   {data: inRelease},
+				"/dists/stable/Release.gpg": {data: validSig},
+			},
+			wantPaths: []string{"dists/stable/InRelease"},
+		},
+		{
+			name: "invalid detached pair with valid InRelease",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease":   {data: inRelease},
+				"/dists/stable/Release":     {data: release},
+				"/dists/stable/Release.gpg": {data: []byte("invalid")},
+			},
+			wantPaths: []string{"dists/stable/InRelease"},
+		},
+		{
+			name:      "all forms absent",
+			responses: map[string]testHTTPResponse{},
+			wantErr:   "no valid signed Release metadata",
+		},
+		{
+			name: "all forms invalid",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease":   {data: []byte("invalid")},
+				"/dists/stable/Release":     {data: release},
+				"/dists/stable/Release.gpg": {data: []byte("invalid")},
+			},
+			wantErr: "no valid signed Release metadata",
+		},
+		{
+			name: "non-404 InRelease failure is fatal",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease":   {status: http.StatusBadGateway},
+				"/dists/stable/Release":     {data: release},
+				"/dists/stable/Release.gpg": {data: validSig},
+			},
+			wantErr: "502 Bad Gateway",
+		},
+		{
+			name: "non-404 detached failure is fatal despite valid InRelease",
+			responses: map[string]testHTTPResponse{
+				"/dists/stable/InRelease": {data: inRelease},
+				"/dists/stable/Release":   {status: http.StatusInternalServerError},
+			},
+			wantErr: "500 Internal Server Error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				response, ok := tt.responses[r.URL.Path]
+				if !ok {
+					http.NotFound(w, r)
+					return
+				}
+				if response.status != 0 {
+					http.Error(w, http.StatusText(response.status), response.status)
+					return
+				}
+				_, _ = w.Write(response.data)
+			}))
+			defer server.Close()
+
+			runner, client := testAPTRunnerAndClient(t, server.URL)
+			_, _, metadata, err := runner.fetchRelease(context.Background(), client, keyring, "stable")
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("fetchRelease error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := metadataPaths(metadata); !reflect.DeepEqual(got, tt.wantPaths) {
+				t.Fatalf("metadata paths = %#v, want %#v", got, tt.wantPaths)
+			}
+		})
+	}
+}
+
+type testHTTPResponse struct {
+	status int
+	data   []byte
 }
 
 func TestValidateClearsignedStructureRejectsTrailingContent(t *testing.T) {
@@ -598,6 +756,15 @@ func signedInRelease(t *testing.T, release []byte) ([]byte, openpgp.EntityList, 
 		t.Fatal(err)
 	}
 	return out.Bytes(), openpgp.EntityList{entity}, plain
+}
+
+func detachedSignature(t *testing.T, entity *openpgp.Entity, release []byte) []byte {
+	t.Helper()
+	var signature bytes.Buffer
+	if err := openpgp.DetachSign(&signature, entity, bytes.NewReader(release), nil); err != nil {
+		t.Fatal(err)
+	}
+	return signature.Bytes()
 }
 
 func writePublishedInRelease(t *testing.T, root, suite string, inRelease []byte) {

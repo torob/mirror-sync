@@ -3,6 +3,7 @@ package httpx
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,6 +30,25 @@ type Client struct {
 	sourceLimiter *limit.Limiter
 	globalLimiter *limit.Limiter
 	retries       int
+}
+
+// StatusError reports a non-successful HTTP response. Callers may use IsStatus
+// to distinguish an explicitly missing resource from transport and server
+// failures without parsing the error text.
+type StatusError struct {
+	RepoName   string
+	URL        string
+	Status     string
+	StatusCode int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s request %s returned %s", e.RepoName, e.URL, e.Status)
+}
+
+func IsStatus(err error, statusCode int) bool {
+	var statusErr *StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == statusCode
 }
 
 var retryBackoff = func(attempt int) time.Duration {
@@ -139,7 +159,10 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 				defer resp.Body.Close()
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 					io.Copy(io.Discard, resp.Body)
-					return fmt.Errorf("%s request %s returned %s", c.source.RepoName, url, resp.Status)
+					return &StatusError{
+						RepoName: c.source.RepoName, URL: url,
+						Status: resp.Status, StatusCode: resp.StatusCode,
+					}
 				}
 				return consume(resp)
 			}()

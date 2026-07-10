@@ -594,10 +594,21 @@ resolves to `/etc/mirrorsync/keyrings/ubuntu-archive-keyring.gpg`.
 
 For each configured APT suite, component, and architecture, `mirrorsync` must:
 
-- Fetch `InRelease` from `primary_source` when available.
-- Fall back to `Release` plus `Release.gpg` when `InRelease` is unavailable.
-- Verify upstream OpenPGP signatures in-process with the configured `keyring`.
-- Parse the verified `Release` metadata.
+- Fetch both signed metadata forms from `primary_source`: `InRelease` and the
+  detached `Release` plus `Release.gpg` pair.
+- Treat only HTTP 404 as an absent signed-metadata file. Timeouts, connection
+  failures, other HTTP statuses, and other request errors fail the sync.
+- Verify each available signed form independently in-process with the configured
+  `keyring`. Publish a valid `InRelease` whenever one is available, and publish
+  `Release` and `Release.gpg` only as a complete, valid pair. If either detached
+  pair member returns 404, skip the entire pair.
+- Ignore a malformed or signature-invalid form when the other form is valid. If
+  neither signed form is valid and complete, fail without publishing new
+  metadata.
+- When both forms are valid and contain matching Release cleartext, preserve and
+  publish all three upstream files and use `InRelease` to drive index downloads.
+  When both forms are valid but differ, prefer and publish only `InRelease`.
+- Parse the selected verified Release metadata.
 - Download referenced `Packages.*`, Debian Installer `Packages.*`, and
   `Sources.*` indexes from `primary_source`.
 - If a configured suite, component, or architecture combination has no matching

@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,6 +64,26 @@ func TestClientExhaustsHTTPRetries(t *testing.T) {
 	}
 	if got := hits.Load(); got != 3 {
 		t.Fatalf("server hits = %d, want 3", got)
+	}
+}
+
+func TestIsStatusRecognizesWrappedHTTPStatusOnly(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	client := testClient(t, server.URL, 0)
+	_, err := client.GetBytes(context.Background(), "missing", 0)
+	if err == nil {
+		t.Fatal("GetBytes succeeded, want 404 error")
+	}
+	if !IsStatus(fmt.Errorf("fetch metadata: %w", err), http.StatusNotFound) {
+		t.Fatalf("IsStatus(%v, 404) = false, want true", err)
+	}
+	if IsStatus(err, http.StatusBadGateway) {
+		t.Fatalf("IsStatus(%v, 502) = true, want false", err)
+	}
+	if IsStatus(context.DeadlineExceeded, http.StatusNotFound) {
+		t.Fatal("IsStatus(deadline exceeded, 404) = true, want false")
 	}
 }
 

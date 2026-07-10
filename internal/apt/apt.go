@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"sort"
@@ -294,53 +295,99 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 
 func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring openpgp.EntityList, suite string) (string, map[string]releaseFile, []model.MetadataFile, error) {
 	inReleaseRel := path.Join("dists", suite, "InRelease")
-	inRelease, err := client.GetBytes(ctx, inReleaseRel, 64<<20)
-	if err == nil {
-		plain, err := verifyInRelease(inRelease, keyring)
-		if err != nil {
-			return "", nil, nil, fmt.Errorf("apt %s verify %s: %w", r.Repo.Name, inReleaseRel, err)
-		}
-		hashes, err := parseReleaseHashes(string(plain))
-		if err != nil {
-			return "", nil, nil, err
-		}
-		if _, err := parseAcquireByHash(string(plain)); err != nil {
-			return "", nil, nil, err
-		}
-		metadata := []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}}
-		releaseRel := path.Join("dists", suite, "Release")
-		if releaseData, err := client.GetBytes(ctx, releaseRel, 64<<20); err == nil {
-			if !releaseMatchesVerifiedCleartext(releaseData, plain) {
-				return "", nil, nil, fmt.Errorf("apt %s %s differs from verified %s cleartext", r.Repo.Name, releaseRel, inReleaseRel)
-			}
-			metadata = append(metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
-		}
-		return string(plain), hashes, metadata, nil
-	}
 	releaseRel := path.Join("dists", suite, "Release")
 	sigRel := path.Join("dists", suite, "Release.gpg")
-	releaseData, rerr := client.GetBytes(ctx, releaseRel, 64<<20)
-	if rerr != nil {
-		return "", nil, nil, fmt.Errorf("apt %s fetch %s failed after InRelease failed (%v): %w", r.Repo.Name, releaseRel, err, rerr)
-	}
-	sig, err := client.GetBytes(ctx, sigRel, 16<<20)
+
+	inRelease, inPresent, err := fetchOptional(ctx, client, inReleaseRel, 64<<20)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, fmt.Errorf("apt %s fetch %s: %w", r.Repo.Name, inReleaseRel, err)
 	}
-	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
-		return "", nil, nil, fmt.Errorf("apt %s verify %s: %w", r.Repo.Name, sigRel, err)
-	}
-	hashes, err := parseReleaseHashes(string(releaseData))
+	releaseData, releasePresent, err := fetchOptional(ctx, client, releaseRel, 64<<20)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, fmt.Errorf("apt %s fetch %s: %w", r.Repo.Name, releaseRel, err)
 	}
-	if _, err := parseAcquireByHash(string(releaseData)); err != nil {
-		return "", nil, nil, err
+	sig, sigPresent, err := fetchOptional(ctx, client, sigRel, 16<<20)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("apt %s fetch %s: %w", r.Repo.Name, sigRel, err)
 	}
-	return string(releaseData), hashes, []model.MetadataFile{
-		{Path: releaseRel, Data: releaseData},
-		{Path: sigRel, Data: sig, SignedLast: true},
-	}, nil
+	return r.selectReleaseForms(keyring, suite, inRelease, inPresent, releaseData, releasePresent, sig, sigPresent)
+}
+
+func fetchOptional(ctx context.Context, client *httpx.Client, rel string, maxBytes int64) ([]byte, bool, error) {
+	data, err := client.GetBytes(ctx, rel, maxBytes)
+	if err == nil {
+		return data, true, nil
+	}
+	if httpx.IsStatus(err, http.StatusNotFound) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+type verifiedRelease struct {
+	text      string
+	cleartext []byte
+	hashes    map[string]releaseFile
+	metadata  []model.MetadataFile
+}
+
+func (r *Runner) selectReleaseForms(keyring openpgp.EntityList, suite string, inRelease []byte, inPresent bool, releaseData []byte, releasePresent bool, sig []byte, sigPresent bool) (string, map[string]releaseFile, []model.MetadataFile, error) {
+	inReleaseRel := path.Join("dists", suite, "InRelease")
+	releaseRel := path.Join("dists", suite, "Release")
+	sigRel := path.Join("dists", suite, "Release.gpg")
+
+	var inForm, detachedForm *verifiedRelease
+	var inErr, detachedErr error
+	if inPresent {
+		plain, err := verifyInRelease(inRelease, keyring)
+		if err == nil {
+			inForm, err = verifiedReleaseMetadata(plain, []model.MetadataFile{{Path: inReleaseRel, Data: inRelease, SignedLast: true}})
+		}
+		if err != nil {
+			inErr = fmt.Errorf("verify %s: %w", inReleaseRel, err)
+		}
+	} else {
+		inErr = fmt.Errorf("%s not found", inReleaseRel)
+	}
+
+	if releasePresent && sigPresent {
+		_, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil)
+		if err == nil {
+			detachedForm, err = verifiedReleaseMetadata(releaseData, []model.MetadataFile{
+				{Path: releaseRel, Data: releaseData},
+				{Path: sigRel, Data: sig, SignedLast: true},
+			})
+		}
+		if err != nil {
+			detachedErr = fmt.Errorf("verify %s: %w", sigRel, err)
+		}
+	} else {
+		detachedErr = fmt.Errorf("detached release pair incomplete (%s present: %t, %s present: %t)", releaseRel, releasePresent, sigRel, sigPresent)
+	}
+
+	if inForm != nil {
+		metadata := append([]model.MetadataFile(nil), inForm.metadata...)
+		if detachedForm != nil && releaseMatchesVerifiedCleartext(releaseData, inForm.cleartext) {
+			metadata = append(metadata, detachedForm.metadata...)
+		}
+		return inForm.text, inForm.hashes, metadata, nil
+	}
+	if detachedForm != nil {
+		return detachedForm.text, detachedForm.hashes, detachedForm.metadata, nil
+	}
+	return "", nil, nil, fmt.Errorf("apt %s has no valid signed Release metadata: %v; %v", r.Repo.Name, inErr, detachedErr)
+}
+
+func verifiedReleaseMetadata(cleartext []byte, metadata []model.MetadataFile) (*verifiedRelease, error) {
+	text := string(cleartext)
+	hashes, err := parseReleaseHashes(text)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := parseAcquireByHash(text); err != nil {
+		return nil, err
+	}
+	return &verifiedRelease{text: text, cleartext: cleartext, hashes: hashes, metadata: metadata}, nil
 }
 
 func (r *Runner) fetchPackagesIndex(ctx context.Context, client *httpx.Client, suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {
@@ -463,48 +510,11 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 	}
 	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, Packages: map[string]model.Package{}}
 	for _, suite := range r.Repo.Suites {
-		var releaseText string
-		var hashes map[string]releaseFile
-		inReleaseRel := path.Join("dists", suite.Name, "InRelease")
-		if data, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, inReleaseRel)); err == nil {
-			plain, err := verifyInRelease(data, keyring)
-			if err != nil {
-				return out, err
-			}
-			releaseText = string(plain)
-			hashes, err = parseReleaseHashes(releaseText)
-			if err != nil {
-				return out, err
-			}
-			out.Metadata = append(out.Metadata, model.MetadataFile{Path: inReleaseRel, Data: data, SignedLast: true})
-			releaseRel := path.Join("dists", suite.Name, "Release")
-			if releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel)); err == nil {
-				if !releaseMatchesVerifiedCleartext(releaseData, plain) {
-					return out, fmt.Errorf("published %s differs from verified %s cleartext", releaseRel, inReleaseRel)
-				}
-				out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData})
-			}
-		} else {
-			releaseRel := path.Join("dists", suite.Name, "Release")
-			sigRel := path.Join("dists", suite.Name, "Release.gpg")
-			releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel))
-			if err != nil {
-				return out, err
-			}
-			sig, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, sigRel))
-			if err != nil {
-				return out, err
-			}
-			if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
-				return out, err
-			}
-			releaseText = string(releaseData)
-			hashes, err = parseReleaseHashes(releaseText)
-			if err != nil {
-				return out, err
-			}
-			out.Metadata = append(out.Metadata, model.MetadataFile{Path: releaseRel, Data: releaseData}, model.MetadataFile{Path: sigRel, Data: sig, SignedLast: true})
+		releaseText, hashes, metadata, err := r.readPublishedSuiteRelease(keyring, suite.Name)
+		if err != nil {
+			return out, err
 		}
+		out.Metadata = append(out.Metadata, metadata...)
 		byHashEnabled, err := parseAcquireByHash(releaseText)
 		if err != nil {
 			return out, err
@@ -531,28 +541,38 @@ func (r *Runner) readPublishedReleaseHashes(suite string) (map[string]releaseFil
 	if err != nil {
 		return nil, err
 	}
+	_, hashes, _, err := r.readPublishedSuiteRelease(keyring, suite)
+	return hashes, err
+}
+
+func (r *Runner) readPublishedSuiteRelease(keyring openpgp.EntityList, suite string) (string, map[string]releaseFile, []model.MetadataFile, error) {
 	inReleaseRel := path.Join("dists", suite, "InRelease")
-	if data, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, inReleaseRel)); err == nil {
-		plain, err := verifyInRelease(data, keyring)
-		if err != nil {
-			return nil, err
-		}
-		return parseReleaseHashes(string(plain))
-	}
 	releaseRel := path.Join("dists", suite, "Release")
 	sigRel := path.Join("dists", suite, "Release.gpg")
-	releaseData, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, releaseRel))
+	inRelease, inPresent, err := readOptionalPublished(r.Repo.AbsPublishPath, inReleaseRel)
 	if err != nil {
-		return nil, err
+		return "", nil, nil, err
 	}
-	sig, err := os.ReadFile(filepathFor(r.Repo.AbsPublishPath, sigRel))
+	releaseData, releasePresent, err := readOptionalPublished(r.Repo.AbsPublishPath, releaseRel)
 	if err != nil {
-		return nil, err
+		return "", nil, nil, err
 	}
-	if _, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil); err != nil {
-		return nil, err
+	sig, sigPresent, err := readOptionalPublished(r.Repo.AbsPublishPath, sigRel)
+	if err != nil {
+		return "", nil, nil, err
 	}
-	return parseReleaseHashes(string(releaseData))
+	return r.selectReleaseForms(keyring, suite, inRelease, inPresent, releaseData, releasePresent, sig, sigPresent)
+}
+
+func readOptionalPublished(root, rel string) ([]byte, bool, error) {
+	data, err := os.ReadFile(filepathFor(root, rel))
+	if err == nil {
+		return data, true, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	return nil, false, err
 }
 
 func (r *Runner) readPublishedIndex(suite, component, arch string, hashes map[string]releaseFile) (string, []byte, bool, error) {

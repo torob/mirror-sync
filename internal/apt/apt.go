@@ -1113,19 +1113,19 @@ func consumeIndex(rel string, file *os.File, consume func(io.Reader) error) (err
 	var closer io.Closer
 	switch {
 	case strings.HasSuffix(rel, ".gz"):
-		zr, err := gzip.NewReader(file)
+		zr, err := gzip.NewReader(bufio.NewReaderSize(file, 128*1024))
 		if err != nil {
 			return err
 		}
 		reader, closer = zr, zr
 	case strings.HasSuffix(rel, ".xz"):
-		xzr, err := xz.NewReader(file)
+		xzr, err := xz.NewReader(bufio.NewReaderSize(file, 128*1024))
 		if err != nil {
 			return err
 		}
 		reader = xzr
 	case strings.HasSuffix(rel, ".bz2"):
-		reader = bzip2.NewReader(file)
+		reader = bzip2.NewReader(bufio.NewReaderSize(file, 128*1024))
 	}
 	err = consume(reader)
 	if closer != nil {
@@ -1163,24 +1163,30 @@ func parsePackages(reader io.Reader, allowedArchs map[string]bool, yield func(mo
 		}
 		return yield(model.Package{Path: rel, Size: size, Checksums: fields.checksums})
 	}
-	return scanControl(reader, func(line string) error {
+	return scanControl(reader, func(line []byte) error {
 		if line[0] == ' ' || line[0] == '\t' {
 			return nil
 		}
-		name, value, ok := strings.Cut(line, ":")
+		name, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			return nil
 		}
-		value = strings.Clone(strings.TrimSpace(value))
-		switch name {
+		value = bytes.TrimSpace(value)
+		switch string(name) {
 		case "Filename":
-			fields.filename = value
+			fields.filename = string(value)
 		case "Architecture":
-			fields.architecture = value
+			fields.architecture = string(value)
 		case "Size":
-			fields.size = value
-		case "MD5sum", "MD5Sum", "SHA1", "SHA256", "SHA512":
-			fields.checksums.Set(name, value)
+			fields.size = string(value)
+		case "MD5sum", "MD5Sum":
+			fields.checksums.MD5Sum = string(value)
+		case "SHA1":
+			fields.checksums.SHA1 = string(value)
+		case "SHA256":
+			fields.checksums.SHA256 = string(value)
+		case "SHA512":
+			fields.checksums.SHA512 = string(value)
 		}
 		return nil
 	}, finish)
@@ -1196,29 +1202,31 @@ func parseSources(reader io.Reader, yield func(model.Package) error) error {
 	var directory string
 	var checksumName string
 	files := map[string]sourcePayload{}
-	addEntry := func(line string) error {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	addEntry := func(line []byte) error {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
 			return nil
 		}
-		parts := strings.Fields(line)
+		parts := bytes.Fields(line)
 		if len(parts) != 3 {
-			return fmt.Errorf("%s: invalid source file entry %q", directory, line)
+			return fmt.Errorf("%s: invalid source file entry %q", directory, string(line))
 		}
-		size, err := strconv.ParseInt(parts[1], 10, 64)
+		size, err := strconv.ParseInt(string(parts[1]), 10, 64)
 		if err != nil {
-			return fmt.Errorf("%s/%s Size: %w", directory, parts[2], err)
+			return fmt.Errorf("%s/%s Size: %w", directory, string(parts[2]), err)
 		}
-		payload := files[parts[2]]
+		name := string(parts[2])
+		payload := files[name]
 		if payload.SizeSet && payload.Size != size {
-			return fmt.Errorf("%s/%s has conflicting sizes", directory, parts[2])
+			return fmt.Errorf("%s/%s has conflicting sizes", directory, name)
 		}
-		if got := payload.Checksums.Get(checksumName); got != "" && !strings.EqualFold(got, parts[0]) {
-			return fmt.Errorf("%s/%s has conflicting %s hashes", directory, parts[2], checksumName)
+		digest := string(parts[0])
+		if got := payload.Checksums.Get(checksumName); got != "" && !strings.EqualFold(got, digest) {
+			return fmt.Errorf("%s/%s has conflicting %s hashes", directory, name, checksumName)
 		}
 		payload.Size, payload.SizeSet = size, true
-		payload.Checksums.Set(checksumName, strings.Clone(parts[0]))
-		files[strings.Clone(parts[2])] = payload
+		payload.Checksums.Set(checksumName, digest)
+		files[name] = payload
 		return nil
 	}
 	finish := func() error {
@@ -1250,24 +1258,24 @@ func parseSources(reader io.Reader, yield func(model.Package) error) error {
 		}
 		return nil
 	}
-	return scanControl(reader, func(line string) error {
+	return scanControl(reader, func(line []byte) error {
 		if line[0] == ' ' || line[0] == '\t' {
 			if checksumName != "" {
 				return addEntry(line)
 			}
 			return nil
 		}
-		name, value, ok := strings.Cut(line, ":")
+		name, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			checksumName = ""
 			return nil
 		}
-		if name == "Directory" {
-			directory = strings.Clone(strings.TrimSpace(value))
+		if bytes.Equal(name, []byte("Directory")) {
+			directory = string(bytes.TrimSpace(value))
 			checksumName = ""
 			return nil
 		}
-		checksumName, ok = sourceChecksumField(name)
+		checksumName, ok = sourceChecksumField(string(name))
 		if ok {
 			return addEntry(value)
 		}
@@ -1291,15 +1299,25 @@ func sourceChecksumField(field string) (string, bool) {
 	}
 }
 
-func scanControl(reader io.Reader, line func(string) error, finish func() error) error {
+func scanControl(reader io.Reader, line func([]byte) error, finish func() error) error {
 	buffered := bufio.NewReaderSize(reader, 64*1024)
 	haveFields := false
+	var pending []byte
 	for {
-		raw, err := buffered.ReadString('\n')
-		if len(raw) > 0 {
-			raw = strings.TrimSuffix(raw, "\n")
-			raw = strings.TrimSuffix(raw, "\r")
-			if raw == "" {
+		raw, prefix, err := buffered.ReadLine()
+		if len(pending) > 0 {
+			pending = append(pending, raw...)
+			raw = pending
+		}
+		if prefix {
+			if len(pending) == 0 {
+				pending = append([]byte(nil), raw...)
+			}
+			continue
+		}
+		pending = nil
+		if len(raw) > 0 || err == nil {
+			if len(raw) == 0 {
 				if haveFields {
 					if finishErr := finish(); finishErr != nil {
 						return finishErr

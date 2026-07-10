@@ -284,11 +284,22 @@ func parseIndex(reader io.Reader, base string, yield func(model.Package) error) 
 	}
 	buffered := bufio.NewReaderSize(reader, 64*1024)
 	haveFields := false
+	var pending []byte
 	for {
-		line, err := buffered.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
-			if line == "" {
+		line, prefix, err := buffered.ReadLine()
+		if len(pending) > 0 {
+			pending = append(pending, line...)
+			line = pending
+		}
+		if prefix {
+			if len(pending) == 0 {
+				pending = append([]byte(nil), line...)
+			}
+			continue
+		}
+		pending = nil
+		if len(line) > 0 || err == nil {
+			if len(line) == 0 {
 				if haveFields {
 					if finishErr := finish(); finishErr != nil {
 						return finishErr
@@ -297,18 +308,18 @@ func parseIndex(reader io.Reader, base string, yield func(model.Package) error) 
 				}
 			} else {
 				haveFields = true
-				key, value, ok := strings.Cut(line, ":")
+				key, value, ok := bytes.Cut(line, []byte(":"))
 				if ok {
-					value = strings.Clone(strings.TrimSpace(value))
-					switch key {
+					value = bytes.TrimSpace(value)
+					switch string(key) {
 					case "P":
-						name = value
+						name = string(value)
 					case "V":
-						version = value
+						version = string(value)
 					case "S":
-						sizeText = value
+						sizeText = string(value)
 					case "C":
-						checksum = value
+						checksum = string(value)
 					}
 				}
 			}

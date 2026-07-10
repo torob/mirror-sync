@@ -351,7 +351,7 @@ func (r *Runner) selectReleaseForms(keyring openpgp.EntityList, suite string, in
 	}
 
 	if releasePresent && sigPresent {
-		_, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(releaseData), bytes.NewReader(sig), nil)
+		err := verifyDetachedSignature(releaseData, sig, keyring)
 		if err == nil {
 			detachedForm, err = verifiedReleaseMetadata(releaseData, []model.MetadataFile{
 				{Path: releaseRel, Data: releaseData},
@@ -376,6 +376,53 @@ func (r *Runner) selectReleaseForms(keyring openpgp.EntityList, suite string, in
 		return detachedForm.text, detachedForm.hashes, detachedForm.metadata, nil
 	}
 	return "", nil, nil, fmt.Errorf("apt %s has no valid signed Release metadata: %v; %v", r.Repo.Name, inErr, detachedErr)
+}
+
+func verifyDetachedSignature(message, signature []byte, keyring openpgp.EntityList) error {
+	signatureReader := io.Reader(bytes.NewReader(signature))
+	trimmed := bytes.TrimLeft(signature, " \t\r\n")
+	if bytes.HasPrefix(trimmed, []byte("-----BEGIN")) {
+		const begin = "-----BEGIN PGP SIGNATURE-----"
+		const end = "-----END PGP SIGNATURE-----"
+		if !bytes.HasPrefix(trimmed, []byte(begin+"\n")) && !bytes.HasPrefix(trimmed, []byte(begin+"\r\n")) {
+			return fmt.Errorf("invalid detached signature armor header")
+		}
+		normalized := bytes.ReplaceAll(bytes.TrimSpace(trimmed), []byte("\r\n"), []byte("\n"))
+		if bytes.ContainsRune(normalized, '\r') {
+			return fmt.Errorf("invalid detached signature armor line ending")
+		}
+		lines := bytes.Split(normalized, []byte("\n"))
+		if len(lines) < 4 || !bytes.Equal(lines[len(lines)-1], []byte(end)) {
+			return fmt.Errorf("invalid detached signature armor footer")
+		}
+		checksumSeen := false
+		for _, line := range lines[1 : len(lines)-1] {
+			line = bytes.TrimSpace(line)
+			if bytes.HasPrefix(line, []byte("-----END ")) || (checksumSeen && len(line) != 0) {
+				return fmt.Errorf("invalid detached signature armor body")
+			}
+			if len(line) == 5 && line[0] == '=' {
+				checksumSeen = true
+			}
+		}
+		block, err := armor.Decode(bytes.NewReader(trimmed))
+		if err != nil {
+			return fmt.Errorf("decode detached signature armor: %w", err)
+		}
+		if block.Type != openpgp.SignatureType {
+			return fmt.Errorf("invalid detached signature armor type %q", block.Type)
+		}
+		decoded, err := io.ReadAll(block.Body)
+		if err != nil {
+			return fmt.Errorf("decode detached signature armor body: %w", err)
+		}
+		if len(decoded) == 0 {
+			return fmt.Errorf("empty detached signature armor body")
+		}
+		signatureReader = bytes.NewReader(decoded)
+	}
+	_, err := openpgp.CheckDetachedSignature(keyring, bytes.NewReader(message), signatureReader, nil)
+	return err
 }
 
 func verifiedReleaseMetadata(cleartext []byte, metadata []model.MetadataFile) (*verifiedRelease, error) {

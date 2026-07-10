@@ -193,7 +193,7 @@ func TestReadPublishedStateSkipsUnadvertisedConfiguredCombination(t *testing.T) 
 	inRelease, keyring, _ := signedInRelease(t, release)
 	writePublishedInRelease(t, root, "stable", inRelease)
 	writeTestFile(t, root, "dists/stable/Release", release)
-	writeTestFile(t, root, "dists/stable/Release.gpg", detachedSignature(t, keyring[0], release))
+	writeTestFile(t, root, "dists/stable/Release.gpg", armoredDetachedSignature(t, keyring[0], release))
 	writeTestFile(t, root, "dists/stable/main/binary-amd64/Packages", nil)
 	writeTestFile(t, root, "dists/stable/stale", []byte("stale"))
 	runner := &Runner{Repo: config.APTRepository{
@@ -348,6 +348,54 @@ func TestFetchReleaseKeepsMatchingPlainReleaseWithInRelease(t *testing.T) {
 	}
 }
 
+func TestFetchReleaseKeepsMatchingArmoredReleaseWithInRelease(t *testing.T) {
+	release := []byte("Origin: armored\n")
+	inRelease, keyring, _ := signedInRelease(t, release)
+	sig := append([]byte(" \t\r\n"), armoredDetachedSignature(t, keyring[0], release)...)
+	runner := &Runner{Repo: config.APTRepository{Name: "repo"}}
+
+	_, _, metadata, err := runner.selectReleaseForms(keyring, "stable", inRelease, true, release, true, sig, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"dists/stable/InRelease", "dists/stable/Release", "dists/stable/Release.gpg"}
+	if got := metadataPaths(metadata); !reflect.DeepEqual(got, want) {
+		t.Fatalf("metadata paths = %#v, want %#v", got, want)
+	}
+}
+
+func TestVerifyDetachedSignatureFormatsAndFailures(t *testing.T) {
+	release := []byte("Origin: example\n")
+	_, keyring, _ := signedInRelease(t, release)
+	binarySig := detachedSignature(t, keyring[0], release)
+	armoredSig := armoredDetachedSignature(t, keyring[0], release)
+	truncatedArmoredSig := armoredSig[:bytes.LastIndex(armoredSig, []byte("-----END PGP SIGNATURE-----"))]
+	armoredSigWithTrailingBody := bytes.Replace(armoredSig, []byte("\n-----END PGP SIGNATURE-----"), []byte("\nignored\n-----END PGP SIGNATURE-----"), 1)
+
+	tests := []struct {
+		name      string
+		signature []byte
+		message   []byte
+		wantErr   bool
+	}{
+		{name: "binary", signature: binarySig, message: release},
+		{name: "armored", signature: armoredSig, message: release},
+		{name: "malformed armor", signature: truncatedArmoredSig, message: release, wantErr: true},
+		{name: "trailing armored body", signature: armoredSigWithTrailingBody, message: release, wantErr: true},
+		{name: "wrong armor type", signature: bytes.Replace(armoredSig, []byte("PGP SIGNATURE"), []byte("PGP MESSAGE"), 2), message: release, wantErr: true},
+		{name: "invalid armored signature", signature: armoredSig, message: []byte("Origin: changed\n"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyDetachedSignature(tt.message, tt.signature, keyring)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("verifyDetachedSignature() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestReleaseMatchesVerifiedCleartextCanonicalLineEndings(t *testing.T) {
 	release := []byte("Origin: example\nSHA256:\n aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 main/binary-amd64/Packages\n")
 	_, _, plain := signedInRelease(t, release)
@@ -400,7 +448,7 @@ func TestFetchReleasePrefersInReleaseWhenDetachedFormDiffers(t *testing.T) {
 func TestFetchReleaseUsesValidDetachedPairWhenInReleaseMalformed(t *testing.T) {
 	release := []byte("Origin: fallback\n")
 	_, keyring, _ := signedInRelease(t, release)
-	detachedSig := detachedSignature(t, keyring[0], release)
+	detachedSig := armoredDetachedSignature(t, keyring[0], release)
 	releaseHits := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -762,6 +810,15 @@ func detachedSignature(t *testing.T, entity *openpgp.Entity, release []byte) []b
 	t.Helper()
 	var signature bytes.Buffer
 	if err := openpgp.DetachSign(&signature, entity, bytes.NewReader(release), nil); err != nil {
+		t.Fatal(err)
+	}
+	return signature.Bytes()
+}
+
+func armoredDetachedSignature(t *testing.T, entity *openpgp.Entity, release []byte) []byte {
+	t.Helper()
+	var signature bytes.Buffer
+	if err := openpgp.ArmoredDetachSign(&signature, entity, bytes.NewReader(release), nil); err != nil {
 		t.Fatal(err)
 	}
 	return signature.Bytes()

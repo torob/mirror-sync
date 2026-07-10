@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	resolvedReleaseStateVersion = 1
+	resolvedReleaseStateVersion = 2
 	resolvedReleaseStateFile    = "resolved-release-files.json"
 )
 
@@ -32,9 +32,12 @@ type resolvedReleaseState struct {
 }
 
 type resolvedReleaseRecord struct {
-	Suite       string   `json:"suite"`
-	Fingerprint string   `json:"fingerprint"`
-	Paths       []string `json:"paths"`
+	Suite             string   `json:"suite"`
+	Fingerprint       string   `json:"fingerprint"`
+	SelectedPaths     []string `json:"selected_paths,omitempty"`
+	ResolvedPaths     []string `json:"resolved_paths,omitempty"`
+	SelectionComplete bool     `json:"selection_complete"`
+	Paths             []string `json:"paths,omitempty"` // version 1 compatibility
 }
 
 func emptyResolvedReleaseState() resolvedReleaseState {
@@ -44,14 +47,26 @@ func emptyResolvedReleaseState() resolvedReleaseState {
 func (s resolvedReleaseState) paths(suite, fingerprint string) (map[string]bool, bool) {
 	for _, record := range s.Releases {
 		if record.Suite == suite && strings.EqualFold(record.Fingerprint, fingerprint) {
-			paths := make(map[string]bool, len(record.Paths))
-			for _, rel := range record.Paths {
+			paths := make(map[string]bool, len(record.ResolvedPaths))
+			for _, rel := range record.ResolvedPaths {
 				paths[rel] = true
 			}
 			return paths, true
 		}
 	}
 	return nil, false
+}
+
+func (s resolvedReleaseState) resolution(suite, fingerprint string) (selected, resolved map[string]bool, complete bool, found bool) {
+	for _, record := range s.Releases {
+		if record.Suite != suite || !strings.EqualFold(record.Fingerprint, fingerprint) {
+			continue
+		}
+		selected = setFromSlice(record.SelectedPaths)
+		resolved = setFromSlice(record.ResolvedPaths)
+		return selected, resolved, record.SelectionComplete, true
+	}
+	return nil, nil, false, false
 }
 
 func (r *Runner) resolvedReleaseStatePath() string {
@@ -80,11 +95,14 @@ func (r *Runner) loadResolvedReleaseState() (resolvedReleaseState, resolvedRelea
 	if err := validateResolvedReleaseState(state); err != nil {
 		return resolvedReleaseState{}, resolvedReleaseStateValid, err
 	}
+	if state.Version == 1 {
+		state = upgradeResolvedReleaseStateV1(state)
+	}
 	return state, resolvedReleaseStateValid, nil
 }
 
 func validateResolvedReleaseState(state resolvedReleaseState) error {
-	if state.Version != resolvedReleaseStateVersion {
+	if state.Version != 1 && state.Version != resolvedReleaseStateVersion {
 		return fmt.Errorf("unsupported resolved Release state version %d", state.Version)
 	}
 	seen := map[string]bool{}
@@ -103,23 +121,60 @@ func validateResolvedReleaseState(state resolvedReleaseState) error {
 			return fmt.Errorf("duplicate resolved Release record for suite %s", record.Suite)
 		}
 		seen[key] = true
-		seenPaths := map[string]bool{}
+		selectedPaths := record.SelectedPaths
+		resolvedPaths := record.ResolvedPaths
+		if state.Version == 1 {
+			selectedPaths = record.Paths
+			resolvedPaths = record.Paths
+		}
+		seenSelected := map[string]bool{}
 		prefix := "dists/" + record.Suite + "/"
-		for _, rel := range record.Paths {
+		for _, rel := range selectedPaths {
 			clean, err := safe.Rel(rel)
 			if err != nil || clean != rel || !strings.HasPrefix(rel, prefix) {
 				return fmt.Errorf("invalid resolved Release path %q", rel)
 			}
-			if seenPaths[rel] {
+			if seenSelected[rel] {
+				return fmt.Errorf("duplicate selected Release path %q", rel)
+			}
+			seenSelected[rel] = true
+		}
+		seenResolved := map[string]bool{}
+		for _, rel := range resolvedPaths {
+			clean, err := safe.Rel(rel)
+			if err != nil || clean != rel || !strings.HasPrefix(rel, prefix) {
+				return fmt.Errorf("invalid resolved Release path %q", rel)
+			}
+			if seenResolved[rel] {
 				return fmt.Errorf("duplicate resolved Release path %q", rel)
 			}
-			seenPaths[rel] = true
+			seenResolved[rel] = true
+			if !seenSelected[rel] {
+				return fmt.Errorf("resolved Release path %q was not selected", rel)
+			}
 		}
 	}
 	return nil
 }
 
+func upgradeResolvedReleaseStateV1(state resolvedReleaseState) resolvedReleaseState {
+	state.Version = resolvedReleaseStateVersion
+	for i := range state.Releases {
+		paths := append([]string(nil), state.Releases[i].Paths...)
+		state.Releases[i].SelectedPaths = append([]string(nil), paths...)
+		state.Releases[i].ResolvedPaths = paths
+		state.Releases[i].SelectionComplete = true
+		state.Releases[i].Paths = nil
+	}
+	return state
+}
+
 func resolvedRecords(state model.RepositoryState) []resolvedReleaseRecord {
+	selectedBySuite := map[string][]string{}
+	for _, file := range state.SelectedFiles {
+		suite := suiteFromCanonical(file.Path)
+		selectedBySuite[suite] = append(selectedBySuite[suite], file.Path)
+	}
 	pathsBySuite := map[string][]string{}
 	for _, file := range state.Files {
 		suite := suiteFromCanonical(file.Path)
@@ -127,9 +182,13 @@ func resolvedRecords(state model.RepositoryState) []resolvedReleaseRecord {
 	}
 	records := make([]resolvedReleaseRecord, 0, len(state.ReleaseFingerprints))
 	for suite, fingerprint := range state.ReleaseFingerprints {
+		selected := append([]string(nil), selectedBySuite[suite]...)
 		paths := append([]string(nil), pathsBySuite[suite]...)
+		sort.Strings(selected)
 		sort.Strings(paths)
-		records = append(records, resolvedReleaseRecord{Suite: suite, Fingerprint: fingerprint, Paths: paths})
+		records = append(records, resolvedReleaseRecord{
+			Suite: suite, Fingerprint: fingerprint, SelectedPaths: selected, ResolvedPaths: paths, SelectionComplete: true,
+		})
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Suite < records[j].Suite })
 	return records
@@ -144,7 +203,7 @@ func (r *Runner) prepareResolvedReleaseState(state model.RepositoryState) error 
 		found := false
 		for i, existing := range current.Releases {
 			if existing.Suite == incoming.Suite && strings.EqualFold(existing.Fingerprint, incoming.Fingerprint) {
-				current.Releases[i] = incoming
+				current.Releases[i] = mergeResolvedReleaseRecords(existing, incoming)
 				found = true
 				break
 			}
@@ -154,6 +213,37 @@ func (r *Runner) prepareResolvedReleaseState(state model.RepositoryState) error 
 		}
 	}
 	return r.writeResolvedReleaseState(current)
+}
+
+func mergeResolvedReleaseRecords(a, b resolvedReleaseRecord) resolvedReleaseRecord {
+	selected := setFromSlice(a.SelectedPaths)
+	for _, rel := range b.SelectedPaths {
+		selected[rel] = true
+	}
+	resolved := setFromSlice(a.ResolvedPaths)
+	for _, rel := range b.SelectedPaths {
+		delete(resolved, rel)
+	}
+	for _, rel := range b.ResolvedPaths {
+		resolved[rel] = true
+	}
+	out := resolvedReleaseRecord{
+		Suite:             b.Suite,
+		Fingerprint:       b.Fingerprint,
+		SelectedPaths:     sortedSet(selected),
+		ResolvedPaths:     sortedSet(resolved),
+		SelectionComplete: a.SelectionComplete || b.SelectionComplete,
+	}
+	return out
+}
+
+func sortedSet(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *Runner) commitResolvedReleaseState(state model.RepositoryState) error {

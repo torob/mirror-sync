@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,7 +109,7 @@ func TestResolveExactContinuesPastMirrorFailures(t *testing.T) {
 			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(good) }))
 			defer primary.Close()
 			staging := t.TempDir()
-			resolved, err := ResolveExact(context.Background(), staging, []*httpx.Client{
+			resolved, err := ResolveExact(context.Background(), "", staging, nil, []*httpx.Client{
 				testClient(t, mirror.URL, 2, 2), testClient(t, primary.URL, 2, 2),
 			}, expected)
 			if err != nil {
@@ -145,7 +146,7 @@ func TestResolveExactPrimaryFailureClassification(t *testing.T) {
 			defer mirror.Close()
 			primary := httptest.NewServer(tt.primary)
 			defer primary.Close()
-			resolved, err := ResolveExact(context.Background(), t.TempDir(), []*httpx.Client{
+			resolved, err := ResolveExact(context.Background(), "", t.TempDir(), nil, []*httpx.Client{
 				testClient(t, mirror.URL, 2, 2), testClient(t, primary.URL, 2, 2),
 			}, expected)
 			if tt.wantErrorPart != "" {
@@ -161,6 +162,101 @@ func TestResolveExactPrimaryFailureClassification(t *testing.T) {
 				t.Fatalf("resolved = %#v, want confirmed missing", resolved)
 			}
 		})
+	}
+}
+
+func TestResolveExactReusesOnlyExplicitlyReusablePublishedFile(t *testing.T) {
+	good := []byte("signed-content")
+	rel := "dists/stable/index.xz"
+	expected := testExpected(map[string][]byte{rel: good})
+	published := t.TempDir()
+	full := filepath.Join(published, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "must not fetch", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	resolved, err := ResolveExact(context.Background(), published, t.TempDir(), map[string]bool{rel: true}, []*httpx.Client{
+		testClient(t, server.URL, 2, 2),
+	}, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 1 || hits.Load() != 0 {
+		t.Fatalf("resolved=%#v hits=%d", resolved, hits.Load())
+	}
+}
+
+func TestResolveExactRepairsCorruptReusablePublishedFile(t *testing.T) {
+	good := []byte("signed-content")
+	rel := "dists/stable/index.xz"
+	expected := testExpected(map[string][]byte{rel: good})
+	published := t.TempDir()
+	full := filepath.Join(published, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("corrupt-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(good)
+	}))
+	defer server.Close()
+
+	staging := t.TempDir()
+	resolved, err := ResolveExact(context.Background(), published, staging, map[string]bool{rel: true}, []*httpx.Client{
+		testClient(t, server.URL, 2, 2),
+	}, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 1 || hits.Load() != 1 {
+		t.Fatalf("resolved=%#v hits=%d", resolved, hits.Load())
+	}
+	staged, err := os.ReadFile(filepath.Join(staging, "payloads", filepath.FromSlash(rel)))
+	if err != nil || !bytes.Equal(staged, good) {
+		t.Fatalf("staged=%q err=%v", staged, err)
+	}
+}
+
+func TestResolveExactDoesNotReuseUnrecordedStagedFile(t *testing.T) {
+	good := []byte("signed-content")
+	rel := "dists/stable/index"
+	expected := testExpected(map[string][]byte{rel: good})
+	staging := t.TempDir()
+	staged := filepath.Join(staging, "payloads", filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(staged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	resolved, err := ResolveExact(context.Background(), "", staging, nil, []*httpx.Client{
+		testClient(t, server.URL, 2, 2),
+	}, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 0 || hits.Load() != 1 {
+		t.Fatalf("resolved=%#v hits=%d, want confirmed missing after one request", resolved, hits.Load())
 	}
 }
 

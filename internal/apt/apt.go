@@ -47,9 +47,17 @@ type releaseFile struct {
 }
 
 func (r *Runner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
+	lock, err := publish.AcquireLock(r.Config.Storage.Staging, "apt", r.Repo.Name)
+	if err != nil {
+		return model.RepositoryPlan{}, err
+	}
+	defer lock.Close()
 	state, err := r.fetchState(ctx)
 	if err != nil {
 		return model.RepositoryPlan{}, err
+	}
+	if err := r.prepareResolvedReleaseState(state); err != nil {
+		return model.RepositoryPlan{}, fmt.Errorf("apt %s write resolved Release state: %w", r.Repo.Name, err)
 	}
 	var bytes int64
 	for _, pkg := range state.Packages {
@@ -234,6 +242,10 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 	if err != nil {
 		return model.RepositoryState{}, err
 	}
+	resolvedState, _, err := r.loadResolvedReleaseState()
+	if err != nil {
+		return model.RepositoryState{}, err
+	}
 	out := model.RepositoryState{ByHashEnabled: map[string]bool{}, ReleaseFingerprints: map[string]string{}, Packages: map[string]model.Package{}}
 	for _, suite := range r.Repo.Suites {
 		releaseText, releaseHashes, metadata, err := r.fetchRelease(ctx, client, keyring, suite.Name)
@@ -245,13 +257,17 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 			return out, err
 		}
 		out.ByHashEnabled[suite.Name] = byHashEnabled
-		out.ReleaseFingerprints[suite.Name] = releaseFingerprint(releaseText)
+		fingerprint := releaseFingerprint(releaseText)
+		out.ReleaseFingerprints[suite.Name] = fingerprint
 		out.Metadata = append(out.Metadata, metadata...)
 		advertised, err := selectReleaseFiles(suite, r.Repo.Architectures, releaseHashes)
 		if err != nil {
 			return out, err
 		}
-		resolved, err := download.ResolveExact(ctx, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(advertised))
+		out.SelectedFiles = append(out.SelectedFiles, advertised...)
+		selectedBefore, resolvedBefore, complete, found := resolvedState.resolution(suite.Name, fingerprint)
+		toResolve := releaseFilesToResolve(advertised, selectedBefore, resolvedBefore, complete && found)
+		resolved, err := download.ResolveExact(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), resolvedBefore, clients, aptFileExpected(toResolve))
 		if err != nil {
 			return out, fmt.Errorf("apt %s resolve suite %s: %w", r.Repo.Name, suite.Name, err)
 		}
@@ -321,6 +337,19 @@ func (r *Runner) fetchState(ctx context.Context) (model.RepositoryState, error) 
 		}
 	}
 	return out, nil
+}
+
+func releaseFilesToResolve(advertised []model.RepositoryFile, selectedBefore, resolvedBefore map[string]bool, selectionComplete bool) []model.RepositoryFile {
+	if !selectionComplete {
+		return advertised
+	}
+	out := make([]model.RepositoryFile, 0, len(advertised))
+	for _, file := range advertised {
+		if resolvedBefore[file.Path] || !selectedBefore[file.Path] {
+			out = append(out, file)
+		}
+	}
+	return out
 }
 
 func (r *Runner) fetchRelease(ctx context.Context, client *httpx.Client, keyring openpgp.EntityList, suite string) (string, map[string]releaseFile, []model.MetadataFile, error) {
@@ -499,7 +528,15 @@ func (r *Runner) readResolvedNamedIndex(suite, dir, name string, hashes map[stri
 		if _, advertised := hashes[rel]; !advertised || !resolved[fullRel] {
 			continue
 		}
-		data, err := os.ReadFile(filepathFor(path.Join(repoStaging(r.Config, "apt", r.Repo.Name), "payloads"), fullRel))
+		staged := filepathFor(path.Join(repoStaging(r.Config, "apt", r.Repo.Name), "payloads"), fullRel)
+		data, err := os.ReadFile(staged)
+		if err == nil {
+			return rel, data, true, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", nil, false, err
+		}
+		data, err = os.ReadFile(filepathFor(r.Repo.AbsPublishPath, fullRel))
 		if err != nil {
 			return "", nil, false, err
 		}
@@ -626,6 +663,7 @@ func (r *Runner) readPublishedReleaseState() (model.RepositoryState, error) {
 		if err != nil {
 			return out, err
 		}
+		out.SelectedFiles = append(out.SelectedFiles, files...)
 		if resolvedStatus == resolvedReleaseStateValid {
 			paths, ok := resolvedState.paths(suite.Name, fingerprint)
 			if !ok {

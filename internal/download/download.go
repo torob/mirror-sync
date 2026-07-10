@@ -46,7 +46,7 @@ type ensureOneFunc func(context.Context, string, string, []*httpx.Client, Expect
 // ResolveExact downloads each expected path from the clients in order and keeps
 // valid copies in staging. A file is reported missing only when the final
 // (authoritative) client returns 404 after every earlier source failed.
-func ResolveExact(ctx context.Context, stagingRoot string, clients []*httpx.Client, expected []Expected) ([]Expected, error) {
+func ResolveExact(ctx context.Context, publishRoot, stagingRoot string, reusableLocal map[string]bool, clients []*httpx.Client, expected []Expected) ([]Expected, error) {
 	if len(expected) == 0 {
 		return nil, nil
 	}
@@ -64,7 +64,7 @@ func ResolveExact(ctx context.Context, stagingRoot string, clients []*httpx.Clie
 	for i := 0; i < workers; i++ {
 		g.Go(func() error {
 			for job := range jobs {
-				resolved, err := resolveExactOne(ctx, stagingRoot, clients, job.exp)
+				resolved, err := resolveExactOne(ctx, publishRoot, stagingRoot, reusableLocal[job.exp.RelPath], clients, job.exp)
 				if err != nil {
 					return err
 				}
@@ -94,21 +94,38 @@ func ResolveExact(ctx context.Context, stagingRoot string, clients []*httpx.Clie
 	return resolved, nil
 }
 
-func resolveExactOne(ctx context.Context, stagingRoot string, clients []*httpx.Client, exp Expected) (bool, error) {
+func resolveExactOne(ctx context.Context, publishRoot, stagingRoot string, reuseLocal bool, clients []*httpx.Client, exp Expected) (bool, error) {
 	staged, err := safe.Join(filepath.Join(stagingRoot, "payloads"), exp.RelPath)
 	if err != nil {
 		return false, err
 	}
-	if ok, err := publish.Verify(staged,
-		publish.WithSize(exp.Size),
-		checksumVerifyOption(exp),
-		publish.WithCheck(exp.Verify),
-	); err != nil {
-		return false, err
-	} else if ok {
-		return true, nil
+	if reuseLocal {
+		if ok, err := publish.Verify(staged,
+			publish.WithSize(exp.Size),
+			checksumVerifyOption(exp),
+			publish.WithCheck(exp.Verify),
+		); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
+		}
 	}
 	os.Remove(staged)
+	if reuseLocal && publishRoot != "" {
+		published, err := safe.Join(publishRoot, exp.RelPath)
+		if err != nil {
+			return false, err
+		}
+		if ok, err := publish.Verify(published,
+			publish.WithSize(exp.Size),
+			checksumVerifyOption(exp),
+			publish.WithCheck(exp.Verify),
+		); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
+		}
+	}
 	var failures []string
 	for i, client := range clients {
 		_, err := downloadOne(ctx, client, exp, Source{RelPath: exp.RelPath}, staged)

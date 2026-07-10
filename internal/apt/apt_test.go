@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -197,13 +198,19 @@ func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) 
 	release := []byte(fmt.Sprintf("Origin: example\nAcquire-By-Hash: yes\nSHA256:\n %x %d main/binary-amd64/Packages.xz\n %x 0 main/binary-amd64/Packages\n", compressedDigest, len(compressed), emptyDigest))
 	inRelease, keyring, _ := signedInRelease(t, release)
 
-	var mirrorSignedHits int
+	var mirrorSignedHits atomic.Int32
+	var mirrorExactHits atomic.Int32
+	var primaryExactHits atomic.Int32
 	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
 		case "/dists/stable/main/binary-amd64/Packages.xz":
+			mirrorExactHits.Add(1)
 			_, _ = w.Write(compressed)
+		case "/dists/stable/main/binary-amd64/Packages":
+			mirrorExactHits.Add(1)
+			http.NotFound(w, req)
 		case "/dists/stable/InRelease", "/dists/stable/Release", "/dists/stable/Release.gpg":
-			mirrorSignedHits++
+			mirrorSignedHits.Add(1)
 			http.Error(w, "must not request signed metadata from mirror", http.StatusInternalServerError)
 		default:
 			http.NotFound(w, req)
@@ -216,7 +223,11 @@ func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) 
 		case "/dists/stable/InRelease":
 			_, _ = w.Write(inRelease)
 		case "/dists/stable/main/binary-amd64/Packages.xz":
+			primaryExactHits.Add(1)
 			http.Error(w, "mirror copy should be sufficient", http.StatusBadGateway)
+		case "/dists/stable/main/binary-amd64/Packages":
+			primaryExactHits.Add(1)
+			http.NotFound(w, req)
 		default:
 			http.NotFound(w, req)
 		}
@@ -245,11 +256,25 @@ func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) 
 		HTTP: httpx.NewFactory(0, limit.New(cfg.MaxInFlightRequests())),
 	}
 
+	if _, err := runner.Plan(context.Background()); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if mirrorSignedHits.Load() != 0 {
+		t.Fatalf("signed metadata requests to mirror = %d, want none", mirrorSignedHits.Load())
+	}
+	firstMirrorExactHits := mirrorExactHits.Load()
+	firstPrimaryExactHits := primaryExactHits.Load()
+	if firstMirrorExactHits != 2 || firstPrimaryExactHits != 1 {
+		t.Fatalf("plan exact hits mirror=%d primary=%d, want mirror=2 primary=1", firstMirrorExactHits, firstPrimaryExactHits)
+	}
 	if _, err := runner.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if mirrorSignedHits != 0 {
-		t.Fatalf("signed metadata requests to mirror = %d, want none", mirrorSignedHits)
+	if got := mirrorExactHits.Load(); got != firstMirrorExactHits {
+		t.Fatalf("sync after plan mirror exact hits = %d, want unchanged %d", got, firstMirrorExactHits)
+	}
+	if got := primaryExactHits.Load(); got != firstPrimaryExactHits {
+		t.Fatalf("sync after plan primary exact hits = %d, want unchanged %d", got, firstPrimaryExactHits)
 	}
 	compressedRel := "dists/stable/main/binary-amd64/Packages.xz"
 	if data, err := os.ReadFile(filepath.Join(publishRoot, filepath.FromSlash(compressedRel))); err != nil || !bytes.Equal(data, compressed) {
@@ -265,6 +290,15 @@ func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) 
 	paths, ok := resolved.paths("stable", releaseFingerprint(string(mustVerifyInRelease(t, inRelease, keyring))))
 	if !ok || !paths[compressedRel] || paths[staleRaw] {
 		t.Fatalf("resolved paths = %#v, found %t", paths, ok)
+	}
+	if _, err := runner.Sync(context.Background()); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if got := mirrorExactHits.Load(); got != firstMirrorExactHits {
+		t.Fatalf("second sync mirror exact hits = %d, want unchanged %d", got, firstMirrorExactHits)
+	}
+	if got := primaryExactHits.Load(); got != firstPrimaryExactHits {
+		t.Fatalf("second sync primary exact hits = %d, want unchanged %d", got, firstPrimaryExactHits)
 	}
 	if _, err := runner.Verify(context.Background()); err != nil {
 		t.Fatalf("verify with confirmed missing raw variant: %v", err)

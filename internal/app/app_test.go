@@ -22,6 +22,14 @@ type fakeRunner struct {
 	pruneFn   func(context.Context) ([]string, error)
 }
 
+type fakePlanRunner struct {
+	planFn func(context.Context) (model.RepositoryPlan, error)
+}
+
+func (r *fakePlanRunner) Plan(ctx context.Context) (model.RepositoryPlan, error) {
+	return r.planFn(ctx)
+}
+
 func (r *fakeRunner) Sync(ctx context.Context) (model.OperationStats, error) {
 	if r.syncFn != nil {
 		return r.syncStats, r.syncFn(ctx)
@@ -41,6 +49,53 @@ func (r *fakeRunner) Prune(ctx context.Context) ([]string, error) {
 		return r.pruneFn(ctx)
 	}
 	return nil, nil
+}
+
+func TestCollectPlansRunsConcurrentlyAndPreservesOrder(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	makeRunner := func(name string) planRunner {
+		return &fakePlanRunner{planFn: func(context.Context) (model.RepositoryPlan, error) {
+			started <- name
+			<-release
+			return model.RepositoryPlan{Name: name}, nil
+		}}
+	}
+	a := &App{
+		planRunnersOverride: func() []planRunner {
+			return []planRunner{makeRunner("first"), makeRunner("second")}
+		},
+	}
+	type result struct {
+		plans []model.RepositoryPlan
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		plans, err := a.collectPlans(context.Background())
+		done <- result{plans: plans, err: err}
+	}()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("plans did not start concurrently")
+		}
+	}
+	close(release)
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if !seen["first"] || !seen["second"] {
+		t.Fatalf("started=%v", seen)
+	}
+	if len(got.plans) != 2 || got.plans[0].Name != "first" || got.plans[1].Name != "second" {
+		t.Fatalf("plans=%#v, want configured order", got.plans)
+	}
 }
 
 func TestEachRepoFailureDoesNotCancelOtherRepositories(t *testing.T) {

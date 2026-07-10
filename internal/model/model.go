@@ -43,6 +43,7 @@ type RepositoryPlan struct {
 
 type RepositoryState struct {
 	Metadata            []MetadataFile
+	SelectedFiles       []RepositoryFile
 	Files               []RepositoryFile
 	ByHashFiles         []ByHashFile
 	ByHashEnabled       map[string]bool

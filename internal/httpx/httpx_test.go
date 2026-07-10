@@ -103,6 +103,54 @@ func TestClientExhaustsHTTPRetries(t *testing.T) {
 	}
 }
 
+func TestClientDoesNotRetryPermanentHTTPFailures(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var hits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.Error(w, "permanent", status)
+			}))
+			defer server.Close()
+
+			client := testClient(t, server.URL, 3)
+			_, err := client.GetBytes(context.Background(), "payload", 0)
+			if err == nil || !IsStatus(err, status) {
+				t.Fatalf("GetBytes error = %v, want HTTP %d", err, status)
+			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("server hits = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestClientRetriesRetryable4xxFailures(t *testing.T) {
+	oldBackoff := retryBackoff
+	retryBackoff = func(int) time.Duration { return 0 }
+	defer func() { retryBackoff = oldBackoff }()
+
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var hits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.Error(w, "retryable", status)
+			}))
+			defer server.Close()
+
+			client := testClient(t, server.URL, 2)
+			_, err := client.GetBytes(context.Background(), "payload", 0)
+			if err == nil || !IsStatus(err, status) {
+				t.Fatalf("GetBytes error = %v, want HTTP %d", err, status)
+			}
+			if got := hits.Load(); got != 3 {
+				t.Fatalf("server hits = %d, want 3", got)
+			}
+		})
+	}
+}
+
 func TestIsStatusRecognizesWrappedHTTPStatusOnly(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()

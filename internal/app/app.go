@@ -25,6 +25,7 @@ type App struct {
 	HTTP                 *httpx.Factory
 	Logger               *slog.Logger
 	repoRunnersOverride  func() []repoTask
+	planRunnersOverride  func() []planRunner
 	repositoryRetryDelay func(int) time.Duration
 	cycleSequence        atomic.Uint64
 }
@@ -141,15 +142,20 @@ type repositoryResults struct {
 }
 
 func (a *App) collectPlans(ctx context.Context) ([]model.RepositoryPlan, error) {
-	var plans []model.RepositoryPlan
-	for _, runner := range a.planRunners() {
-		p, err := runner.Plan(ctx)
-		if err != nil {
-			return nil, err
-		}
-		plans = append(plans, p)
+	runners := a.planRunners()
+	plans := make([]model.RepositoryPlan, len(runners))
+	errs := make([]error, len(runners))
+	var wg sync.WaitGroup
+	for i, runner := range runners {
+		i, runner := i, runner
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			plans[i], errs[i] = runner.Plan(ctx)
+		}()
 	}
-	return plans, nil
+	wg.Wait()
+	return plans, errors.Join(errs...)
 }
 
 func (a *App) runRepositories(ctx context.Context, operation, trigger string, cycle uint64, retries int, fn func(context.Context, repoRunner) (model.OperationStats, error)) error {
@@ -300,6 +306,9 @@ func (a *App) repoRunners() []repoTask {
 }
 
 func (a *App) planRunners() []planRunner {
+	if a.planRunnersOverride != nil {
+		return a.planRunnersOverride()
+	}
 	var out []planRunner
 	for _, repo := range a.Config.APT.Repositories {
 		out = append(out, &apt.Runner{Config: a.Config, Repo: repo, HTTP: a.HTTP})

@@ -200,6 +200,9 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 			last = err
 		}
 		if attempt < c.retries {
+			if !retryableHTTPError(last) {
+				return last
+			}
 			delay := retryBackoff(attempt + 1)
 			c.logger.Warn("HTTP request failed; retrying",
 				"repository", c.source.RepoName,
@@ -221,6 +224,22 @@ func (c *Client) Do(ctx context.Context, rel string, consume func(*http.Response
 		}
 	}
 	return last
+}
+
+func retryableHTTPError(err error) bool {
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		return true
+	}
+	if statusErr.StatusCode >= 500 {
+		return true
+	}
+	switch statusErr.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
 }
 
 func transportCause(err error) error {

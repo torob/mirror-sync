@@ -1,6 +1,7 @@
 package publish
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -192,6 +193,11 @@ func AtomicWrite(root, stagingRoot, rel string, data []byte) error {
 	if err != nil {
 		return err
 	}
+	if unchanged, err := preserveMatchingFile(final, data); err != nil {
+		return err
+	} else if unchanged {
+		return nil
+	}
 	tmpDir := filepath.Join(stagingRoot, "metadata-tmp", filepath.Dir(filepath.FromSlash(rel)))
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return err
@@ -229,6 +235,46 @@ func AtomicWrite(root, stagingRoot, rel string, data []byte) error {
 	}
 	ok = true
 	return syncDir(filepath.Dir(final))
+}
+
+// preserveMatchingFile avoids replacing byte-identical regular files so their
+// inode and modification time remain stable. Comparison is streamed because
+// metadata such as APKINDEX may already occupy a large in-memory buffer.
+func preserveMatchingFile(path string, data []byte) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(data)) {
+		return false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, nil
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil || !os.SameFile(info, openedInfo) {
+		return false, nil
+	}
+
+	var buf [128 * 1024]byte
+	for offset := 0; offset < len(data); {
+		chunk := len(data) - offset
+		if chunk > len(buf) {
+			chunk = len(buf)
+		}
+		if _, err := io.ReadFull(f, buf[:chunk]); err != nil {
+			return false, nil
+		}
+		if !bytes.Equal(buf[:chunk], data[offset:offset+chunk]) {
+			return false, nil
+		}
+		offset += chunk
+	}
+	if openedInfo.Mode() != PublishedFileMode {
+		if err := f.Chmod(PublishedFileMode); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func PublishMetadata(root, stagingRoot string, files []model.MetadataFile) error {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -61,6 +62,133 @@ func TestAtomicWritePublishesReadableFileAndDirectoriesWithRestrictiveUmask(t *t
 	assertMode(t, filepath.Join(root, "dists"), PublishedDirMode)
 	assertMode(t, filepath.Join(root, "dists", "noble"), PublishedDirMode)
 	assertMode(t, filepath.Join(root, "dists", "noble", "main", "binary-amd64"), PublishedDirMode)
+}
+
+func TestAtomicWritePreservesMatchingFile(t *testing.T) {
+	root := t.TempDir()
+	staging := t.TempDir()
+	rel := "dists/noble/InRelease"
+	data := []byte("signed metadata")
+	if err := AtomicWrite(root, staging, rel, data); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, filepath.FromSlash(rel))
+	oldTime := time.Unix(1_234_567_890, 123_456_789)
+	if err := os.Chtimes(file, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AtomicWrite(root, staging, rel, append([]byte(nil), data...)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("matching file was replaced")
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("matching file mtime = %v, want %v", after.ModTime(), before.ModTime())
+	}
+}
+
+func TestAtomicWriteNormalizesMatchingFileModeInPlace(t *testing.T) {
+	root := t.TempDir()
+	staging := t.TempDir()
+	rel := "state.json"
+	data := []byte("{}\n")
+	if err := AtomicWrite(root, staging, rel, data); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, rel)
+	if err := os.Chmod(file, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Unix(1_234_567_890, 0)
+	if err := os.Chtimes(file, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AtomicWrite(root, staging, rel, data); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("matching file was replaced while normalizing its mode")
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("matching file mtime = %v, want %v", after.ModTime(), before.ModTime())
+	}
+	assertMode(t, file, PublishedFileMode)
+}
+
+func TestAtomicWriteReplacesChangedAndNonRegularFiles(t *testing.T) {
+	t.Run("changed content", func(t *testing.T) {
+		root := t.TempDir()
+		staging := t.TempDir()
+		rel := "dists/noble/Release"
+		if err := AtomicWrite(root, staging, rel, []byte("old metadata")); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(root, filepath.FromSlash(rel))
+		before, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := AtomicWrite(root, staging, rel, []byte("new metadata")); err != nil {
+			t.Fatal(err)
+		}
+		after, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(before, after) {
+			t.Fatal("changed file was not atomically replaced")
+		}
+		if got, err := os.ReadFile(file); err != nil || string(got) != "new metadata" {
+			t.Fatalf("published content = %q, err %v", got, err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		root := t.TempDir()
+		staging := t.TempDir()
+		target := filepath.Join(t.TempDir(), "target")
+		data := []byte("same metadata")
+		if err := os.WriteFile(target, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rel := "dists/noble/InRelease"
+		file := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, file); err != nil {
+			t.Fatal(err)
+		}
+		if err := AtomicWrite(root, staging, rel, data); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Lstat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("published mode = %s, want regular file", info.Mode())
+		}
+	})
 }
 
 func TestVerifyOptions(t *testing.T) {

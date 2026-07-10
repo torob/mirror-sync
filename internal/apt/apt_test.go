@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
@@ -292,8 +293,27 @@ func TestSyncResolvesExactDistsFromMirrorsAndPersistsMissingPaths(t *testing.T) 
 	if !ok || !paths[compressedRel] || paths[staleRaw] {
 		t.Fatalf("resolved paths = %#v, found %t", paths, ok)
 	}
+	publishedInRelease := filepath.Join(publishRoot, "dists/stable/InRelease")
+	oldTime := time.Unix(1_234_567_890, 0)
+	if err := os.Chtimes(publishedInRelease, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	inReleaseBefore, err := os.Stat(publishedInRelease)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := runner.Sync(context.Background()); err != nil {
 		t.Fatalf("second sync: %v", err)
+	}
+	inReleaseAfter, err := os.Stat(publishedInRelease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(inReleaseBefore, inReleaseAfter) {
+		t.Fatal("second sync replaced unchanged InRelease")
+	}
+	if !inReleaseAfter.ModTime().Equal(inReleaseBefore.ModTime()) {
+		t.Fatalf("second sync changed InRelease mtime to %v, want %v", inReleaseAfter.ModTime(), inReleaseBefore.ModTime())
 	}
 	if got := mirrorExactHits.Load(); got != firstMirrorExactHits {
 		t.Fatalf("second sync mirror exact hits = %d, want unchanged %d", got, firstMirrorExactHits)

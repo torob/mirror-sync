@@ -519,6 +519,11 @@ Requirements:
   directories created or touched during publishing must have mode `0755`.
   These modes are exact and must not depend on the process umask. Existing
   payloads reused during sync are not mode-repaired by normal sync.
+- Atomic metadata and state writes must leave an existing byte-identical regular
+  file in place so its inode and modification time remain unchanged. If its
+  mode differs from `0644`, the mode is normalized in place. Missing,
+  non-regular, unreadable, or byte-different destinations use the normal atomic
+  replacement flow.
 - Signed metadata files may be buffered in memory when their expected size is
   small enough for normal repository metadata processing. APT Packages and
   Sources indexes and the APKINDEX member must be decompressed and parsed

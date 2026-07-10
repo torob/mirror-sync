@@ -100,13 +100,13 @@ func (r *Runner) Sync(ctx context.Context) (model.OperationStats, error) {
 	if err != nil {
 		return stats, err
 	}
-	fileStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(state.Files))
-	stats.Add(fileStats)
+	packageStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
+	stats.Add(packageStats)
 	if err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}
-	packageStats, err := download.EnsureSynced(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptPackageExpected(state.Packages))
-	stats.Add(packageStats)
+	fileStats, err := download.EnsureRepaired(ctx, r.Repo.AbsPublishPath, repoStaging(r.Config, "apt", r.Repo.Name), clients, aptFileExpected(state.Files))
+	stats.Add(fileStats)
 	if err != nil {
 		return stats, fmt.Errorf("apt %s: %w", r.Repo.Name, err)
 	}

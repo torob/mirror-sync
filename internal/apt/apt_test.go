@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -343,6 +344,77 @@ func TestSyncFailsOnNon404PrimaryDistsFailureBeforePublishingMetadata(t *testing
 	}
 	if _, err := os.Stat(filepath.Join(publishRoot, "dists", "stable", "InRelease")); !os.IsNotExist(err) {
 		t.Fatalf("new signed metadata was published after failed exact file: %v", err)
+	}
+}
+
+func TestSyncKeepsCanonicalIndexesStagedUntilReferencedPayloadsSucceed(t *testing.T) {
+	payloadData := []byte("payload")
+	payloadDigest := sha256.Sum256(payloadData)
+	tests := []struct {
+		name       string
+		indexRel   string
+		indexData  func(string) []byte
+		payloadRel string
+	}{
+		{
+			name:     "binary Packages",
+			indexRel: "main/binary-amd64/Packages",
+			indexData: func(payloadRel string) []byte {
+				return []byte(fmt.Sprintf("Package: example\nArchitecture: amd64\nFilename: %s\nSize: %d\nSHA256: %x\n", payloadRel, len(payloadData), payloadDigest))
+			},
+			payloadRel: "pool/main/e/example/example_1_amd64.deb",
+		},
+		{
+			name:     "source Sources",
+			indexRel: "main/source/Sources",
+			indexData: func(payloadRel string) []byte {
+				return []byte(fmt.Sprintf("Package: example\nDirectory: %s\nChecksums-Sha256:\n %x %d %s\n", path.Dir(payloadRel), payloadDigest, len(payloadData), path.Base(payloadRel)))
+			},
+			payloadRel: "pool/main/e/example/example_1.dsc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			indexData := tt.indexData(tt.payloadRel)
+			indexDigest := sha256.Sum256(indexData)
+			release := []byte(fmt.Sprintf("Origin: example\nSHA256:\n %x %d %s\n", indexDigest, len(indexData), tt.indexRel))
+			inRelease, keyring, _ := signedInRelease(t, release)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				switch strings.TrimPrefix(req.URL.Path, "/") {
+				case "dists/stable/InRelease":
+					_, _ = w.Write(inRelease)
+				case path.Join("dists/stable", tt.indexRel):
+					_, _ = w.Write(indexData)
+				default:
+					http.NotFound(w, req)
+				}
+			}))
+			defer server.Close()
+
+			publishRoot := t.TempDir()
+			canonicalRel := path.Join("dists/stable", tt.indexRel)
+			oldIndex := []byte("previous canonical index")
+			writeTestFile(t, publishRoot, canonicalRel, oldIndex)
+			runner := testFetchStateRunner(t, server.URL, writeTestKeyring(t, keyring), publishRoot, []string{"amd64"})
+
+			if _, err := runner.Sync(context.Background()); err == nil {
+				t.Fatal("Sync() succeeded with an unavailable referenced payload")
+			}
+			got, err := os.ReadFile(filepath.Join(publishRoot, filepath.FromSlash(canonicalRel)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, oldIndex) {
+				t.Fatalf("canonical index changed after payload failure: got %q, want %q", got, oldIndex)
+			}
+			if _, err := os.Stat(filepath.Join(publishRoot, "dists", "stable", "InRelease")); !os.IsNotExist(err) {
+				t.Fatalf("new signed metadata was published after payload failure: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(publishRoot, filepath.FromSlash(tt.payloadRel))); !os.IsNotExist(err) {
+				t.Fatalf("unavailable payload was published: %v", err)
+			}
+		})
 	}
 }
 
